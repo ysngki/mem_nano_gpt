@@ -317,7 +317,7 @@ if compile:
 if ddp:
     # DistributedDataParallel is not needed when a module doesn't have any parameter that requires a gradient.
     # model = DDP(model, device_ids=[ddp_local_rank]) 
-    evolver_model = DDP(evolver_model, device_ids=[ddp_local_rank], broadcast_buffers=False) # https://github.com/pytorch/pytorch/issues/22095
+    evolver_model = DDP(evolver_model, device_ids=[ddp_local_rank], broadcast_buffers=False, find_unused_parameters=True) # https://github.com/pytorch/pytorch/issues/22095
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -437,8 +437,8 @@ while True:
                     past_segments_y.append(this_y)
 
                 # last memory -> X
-                if input_memory is None or si==0:
-                    target_model_memory = None
+                if si==0:
+                    pass
                 else:
                     target_model_memory = evolver_model(input_memory=input_memory, produce_memory_flag=True)
 
@@ -452,13 +452,13 @@ while True:
 
             # 复习一下past_segments
             if input_memory is None:
-                target_model_memory = None
+                pass
             else:
                 target_model_memory = evolver_model(input_memory=input_memory, produce_memory_flag=True)
 
-            for (this_x, this_y) in zip(past_segments_x, past_segments_y):
-                logits, loss = model(this_x, this_y, target_model_memory)
-                all_loss = loss + all_loss
+                for (this_x, this_y) in zip(past_segments_x, past_segments_y):
+                    logits, loss = model(this_x, this_y, target_model_memory)
+                    all_loss = loss + all_loss
 
             ### 
             all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation

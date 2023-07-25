@@ -10,7 +10,7 @@ wandb_run_name='first_train_mem'
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 init_from = 'gpt2'
 
-batch_size = 4
+batch_size = 8
 block_size = 512
 min_block_size = 256
 gradient_accumulation_steps = 8
@@ -37,6 +37,6 @@ evolver_n_mem = 100
 evolver_pad_token_id = 0
 evolver_gpt2_token_id_offset = 20 # the token id produced by gpt2 tokenizer should added by this offset
 
-segment_num = 12 # if > 1, train memory
+segment_num = 2 # if > 1, train memory
 
 num_target_model_layer = 12
