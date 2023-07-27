@@ -47,6 +47,8 @@ evolver_gpt2_token_id_offset = 20 # the token id produced by gpt2 tokenizer shou
 
 segment_num = 1 # if > 1, train memory
 num_target_model_layer = 12
+
+remember_prob = 95 # 大于这个的话，minibatch的记忆都会被删除
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -373,23 +375,24 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and False:
+    if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+        # if wandb_log:
+        #     wandb.log({
+        #         "iter": iter_num,
+        #         "train/loss": losses['train'],
+        #         "val/loss": losses['val'],
+        #         "lr": lr,
+        #         "mfu": running_mfu*100, # convert to percentage
+        #     })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'evolver_model': raw_evolver_model.state_dict(),
+                    'evolver_config': evolver_config,
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
@@ -405,6 +408,7 @@ while True:
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         all_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        gpt_loss = torch.tensor(0.0, device=device)
         
         input_memory = input_memory_list[micro_step]
 
@@ -443,7 +447,11 @@ while True:
                     target_model_memory = evolver_model(input_memory=input_memory, produce_memory_flag=True)
 
                     logits, loss = model(no_offset_x, this_y, target_model_memory)
-                    all_loss = loss + all_loss
+                    all_loss = loss / (segment_num - 1) + all_loss
+
+                    with torch.no_grad():
+                        logits, loss = model(no_offset_x, this_y)
+                        gpt_loss = loss / (segment_num - 1) + gpt_loss
 
                 # X -> memory
                 this_attention_mask = this_x.ne(evolver_pad_token_id).int()
@@ -458,10 +466,15 @@ while True:
 
                 for (this_x, this_y) in zip(past_segments_x, past_segments_y):
                     logits, loss = model(this_x, this_y, target_model_memory)
-                    all_loss = loss + all_loss
+                    all_loss = loss / len(past_segments_x) + all_loss
+
+                    with torch.no_grad():
+                        logits, loss = model(this_x, this_y)
+                        gpt_loss = loss / len(past_segments_x) + gpt_loss
 
             ### 
             all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            gpt_loss = gpt_loss / gradient_accumulation_steps
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_seq_train_batch(evolver_gpt2_token_id_offset)
@@ -469,6 +482,10 @@ while True:
         scaler.scale(all_loss).backward()
 
         input_memory_list[micro_step] = input_memory.detach()
+        # 重启记忆
+        for bi in range(input_memory.shape[0]):
+            if random.randint(1, 100) > remember_prob:
+                input_memory_list[micro_step][bi] = raw_evolver_model.initial_memory
 
     # clip the gradient
     if grad_clip != 0.0:
@@ -488,10 +505,19 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = all_loss.item() * gradient_accumulation_steps
+        gpt_lossf = gpt_loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, gpt_loss {gpt_lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": lossf,
+                "train/gpt_loss": gpt_lossf,
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
     iter_num += 1
     local_iter_num += 1
 
