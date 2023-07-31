@@ -331,7 +331,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -426,6 +426,7 @@ while True:
             past_segments_y = []
 
             sampled_segments_index = set(random.sample(range(segment_num), max(int(segment_num * 0.4), 1)))
+            trained_seg_num = segment_num + len(sampled_segments_index)
 
             for si in range(segment_num):
                 this_x = this_micro_X[:, si, :]
@@ -440,37 +441,31 @@ while True:
                     past_segments_x.append(no_offset_x)
                     past_segments_y.append(this_y)
 
-                # last memory -> X
-                if si==0:
-                    pass
-                else:
-                    target_model_memory = evolver_model(input_memory=input_memory, produce_memory_flag=True)
-
-                    logits, loss = model(no_offset_x, this_y, target_model_memory)
-                    all_loss = loss / (segment_num - 1) + all_loss
-
-                    with torch.no_grad():
-                        logits, loss = model(no_offset_x, this_y)
-                        gpt_loss = loss / (segment_num - 1) + gpt_loss
-
                 # X -> memory
-                this_attention_mask = this_x.ne(evolver_pad_token_id).int()
+                this_attention_mask = x_padding_mask.int()
 
                 input_memory = evolver_model(input_ids=this_x, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
 
-            # 复习一下past_segments
-            if input_memory is None:
-                pass
-            else:
+                # last memory -> X
                 target_model_memory = evolver_model(input_memory=input_memory, produce_memory_flag=True)
 
-                for (this_x, this_y) in zip(past_segments_x, past_segments_y):
-                    logits, loss = model(this_x, this_y, target_model_memory)
-                    all_loss = loss / len(past_segments_x) + all_loss
+                _, loss = model(no_offset_x, this_y, target_model_memory)
+                all_loss = loss / trained_seg_num + all_loss
 
-                    with torch.no_grad():
-                        logits, loss = model(this_x, this_y)
-                        gpt_loss = loss / len(past_segments_x) + gpt_loss
+                with torch.no_grad():
+                    _, loss = model(no_offset_x, this_y)
+                    gpt_loss = loss / trained_seg_num + gpt_loss
+
+            # 复习一下past_segments
+            target_model_memory = evolver_model(input_memory=input_memory, produce_memory_flag=True)
+
+            for (this_x, this_y) in zip(past_segments_x, past_segments_y):
+                _, loss = model(this_x, this_y, target_model_memory)
+                all_loss = loss / trained_seg_num + all_loss
+
+                with torch.no_grad():
+                    _, loss = model(this_x, this_y)
+                    gpt_loss = loss / trained_seg_num + gpt_loss
 
             ### 
             all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
@@ -482,10 +477,12 @@ while True:
         scaler.scale(all_loss).backward()
 
         input_memory_list[micro_step] = input_memory.detach()
-        # 重启记忆
-        for bi in range(input_memory.shape[0]):
-            if random.randint(1, 100) > remember_prob:
-                input_memory_list[micro_step][bi] = raw_evolver_model.initial_memory
+        input_memory_list[micro_step] = None
+
+        # # 重启记忆
+        # for bi in range(input_memory.shape[0]):
+        #     if random.randint(1, 100) > remember_prob:
+        #         input_memory_list[micro_step][bi] = raw_evolver_model.initial_memory
 
     # clip the gradient
     if grad_clip != 0.0:
