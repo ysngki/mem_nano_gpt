@@ -1066,7 +1066,10 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         super().__init__(config)
         self.config = config
 
-        self.embeddings = RobertaEmbeddings(config)
+        if self.config.no_embeddings:
+            self.embeddings = None
+        else:
+            self.embeddings = RobertaEmbeddings(config)
         self.encoder = RobertaEncoder(config)
 
         self.num_memory = config.num_memory
@@ -1108,10 +1111,16 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         return mfu
     
     def get_input_embeddings(self):
+        if self.config.no_embeddings:
+            return None
+
         return self.embeddings.word_embeddings
 
     def set_input_embeddings(self, value):
-        self.embeddings.word_embeddings = value
+        if self.config.no_embeddings:
+            pass
+        else:
+            self.embeddings.word_embeddings = value
 
     def _prune_heads(self, heads_to_prune):
         """
@@ -1147,7 +1156,10 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
 
         return optimizer
     
-    def produce_target_model_memory(self, input_memory):
+    def produce_target_model_parameter(self, input_memory):
+        if input_memory is None:
+            return None
+        
         batch_size, memory_len, _ = input_memory.size()
 
         all_layer_new_memory =  self.conversion_dense(input_memory) # (batch size, memory len, dim * gpt layer num)
@@ -1179,7 +1191,7 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         input_memory: Optional[torch.Tensor] = None,
-        produce_memory_flag = False,
+        produce_parameter_flag = False,
     ) -> Union[Tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
         r"""
         encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
@@ -1202,8 +1214,8 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
             `past_key_values`).
         """
 
-        if produce_memory_flag:
-            return self.produce_target_model_memory(input_memory)
+        if produce_parameter_flag:
+            return self.produce_target_model_parameter(input_memory)
         
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1234,13 +1246,16 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
 
-        if token_type_ids is None:
-            if hasattr(self.embeddings, "token_type_ids"):
-                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        if self.config.no_embeddings:
+            token_type_ids = None
+        else:
+            if token_type_ids is None:
+                if hasattr(self.embeddings, "token_type_ids"):
+                    buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
+                    buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
+                    token_type_ids = buffered_token_type_ids_expanded
+                else:
+                    token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
         # attention mask for memory
         if self.num_memory > 0:
@@ -1269,13 +1284,16 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
         
-        embedding_output = self.embeddings(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            token_type_ids=token_type_ids,
-            inputs_embeds=inputs_embeds,
-            past_key_values_length=past_key_values_length,
-        )
+        if self.config.no_embeddings:
+            embedding_output = inputs_embeds
+        else:
+            embedding_output = self.embeddings(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                token_type_ids=token_type_ids,
+                inputs_embeds=inputs_embeds,
+                past_key_values_length=past_key_values_length,
+            )
 
         # perfix memory
         actual_memory_len = 0

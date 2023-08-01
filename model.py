@@ -100,13 +100,13 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, input_memory=None):
-        if input_memory is None:
+    def forward(self, x, input_parameter=None):
+        if input_parameter is None:
             next_x = x + self.attn(self.ln_1(x))
         else:
-            x = torch.cat((input_memory, x), dim=1)
+            x = torch.cat((input_parameter, x), dim=1)
             x = x + self.attn(self.ln_1(x))
-            next_x = x[:, input_memory.shape[1]:, :]
+            next_x = x[:, input_parameter.shape[1]:, :]
 
         next_x = next_x + self.mlp(self.ln_2(next_x))
         return next_x
@@ -388,7 +388,7 @@ class MemoryGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, input_memory=None):
+    def forward(self, idx, targets=None, input_parameter=None, output_embeds=False):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -397,19 +397,24 @@ class MemoryGPT(nn.Module):
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+
+        x = tok_emb + pos_emb
+        if output_embeds:
+            return x
+    
+        x = self.transformer.drop(x)
         for bi, block in enumerate(self.transformer.h):
             # select memory
-            if input_memory is None:
-                this_input_memory = None
-            elif input_memory.dim() == 3:
-                this_input_memory = input_memory
-            elif input_memory.dim() == 4:
-                this_input_memory = input_memory[bi]
+            if input_parameter is None:
+                this_input_parameter = None
+            elif input_parameter.dim() == 3:
+                this_input_parameter = input_parameter
+            elif input_parameter.dim() == 4:
+                this_input_parameter = input_parameter[bi]
             else:
                 raise Exception("check here (input memory dimension) !")
             
-            x = block(x, input_memory=this_input_memory)
+            x = block(x, input_parameter=this_input_parameter)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -534,7 +539,7 @@ class MemoryGPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, input_memory=None, eot_token=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, input_parameter=None, eot_token=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -544,7 +549,7 @@ class MemoryGPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond, input_memory=input_memory)
+            logits, _ = self(idx_cond, input_parameter=input_parameter)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

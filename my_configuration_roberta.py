@@ -126,6 +126,7 @@ class MemoryRobertaConfig(PretrainedConfig):
         num_memory=0,
         gpt2_token_id_offset=0,
         num_target_model_layer=12,
+        no_embeddings=False,
         **kwargs,
     ):
         super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -148,6 +149,7 @@ class MemoryRobertaConfig(PretrainedConfig):
         self.num_memory = num_memory
         self.gpt2_token_id_offset = gpt2_token_id_offset
         self.num_target_model_layer = num_target_model_layer
+        self.no_embeddings = no_embeddings
 
 
 class RobertaOnnxConfig(OnnxConfig):

@@ -42,8 +42,10 @@ evolver_n_embd = 768
 evolver_n_intermediate = 3072
 evolver_n_mem = 50
 
+######### no use
 evolver_pad_token_id = 0
 evolver_gpt2_token_id_offset = 20 # the token id produced by gpt2 tokenizer should added by this offset
+#################
 
 segment_num = 1 # if > 1, train memory
 num_target_model_layer = 12
@@ -52,6 +54,7 @@ remember_prob = 95 # 大于这个的话，minibatch的记忆都会被删除
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+seed=1337
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -127,7 +130,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -167,24 +170,20 @@ for bi in range(0, actual_batch_size):
 
 
 # get data for a minibatch
-def get_seq_train_batch(token_id_offset=0):
-    global evolver_pad_token_id
-
+def get_seq_train_batch():
     data = train_data
 
-    # return_offset_x = []
-    return_x = []
-    return_y = []
+    x_list = []
+    y_list = []
 
     for _ in range(segment_num):
         random_length = torch.randint(block_size - min_block_size, (actual_batch_size,)) # random segment len for each batch item
 
         for bi in range(actual_batch_size):
-            random_length[bi] = random_length[bi] + min_block_size + this_rank_batch_train_data_pointer[bi] # end index
-            
-            segment_ends = random_length
-            segment_ends[bi] = segment_ends[bi] if segment_ends[bi] < len(data) else len(data) - 1
+            this_end = random_length[bi] + min_block_size + this_rank_batch_train_data_pointer[bi] # end index
+            random_length[bi] = this_end if this_end < len(data) else len(data) - 1
 
+        segment_ends = random_length
 
         # (batch size, xxx)
         x = [torch.from_numpy((data[this_rank_batch_train_data_pointer[bi]:segment_ends[bi]]).astype(np.int64)) for bi in range(actual_batch_size)]
@@ -192,34 +191,34 @@ def get_seq_train_batch(token_id_offset=0):
 
         # padding to (batch size, block size)
 
-        # offset_padding_x = x[0].new_full((batch_size, block_size), fill_value=evolver_pad_token_id)
-        padding_x = x[0].new_full((actual_batch_size, block_size), fill_value=evolver_pad_token_id)
+        padding_x = x[0].new_full((actual_batch_size, block_size), fill_value=0)
         padding_y = y[0].new_full((actual_batch_size, block_size), fill_value=-1)
 
         for bi in range(actual_batch_size):
-            # offset_padding_x[bi][:len(x[bi])] = x[bi] + token_id_offset
-
-            padding_x[bi][:len(x[bi])] = x[bi] + token_id_offset
+            padding_x[bi][:len(x[bi])] = x[bi] + 1
             padding_y[bi][:len(y[bi])] = y[bi]
 
             # update this_rank_batch_train_data_pointer
             this_rank_batch_train_data_pointer[bi] = segment_ends[bi] if segment_ends[bi] < len(data) - min_block_size else 0
 
         # return_offset_x.append(offset_padding_x)
-        return_x.append(padding_x)
-        return_y.append(padding_y)
+        x_list.append(padding_x)
+        y_list.append(padding_y)
     
     # (batch size, segment num, block size)
-    x = torch.stack(return_x, dim=1)
-    y = torch.stack(return_y, dim=1)
+    x = torch.stack(x_list, dim=1)
+    attention_mask = x.ne(0).int()
+    x = x + x.new_full(attention_mask.size(), fill_value=-1) * attention_mask # pad_token_id is 0
+
+    y = torch.stack(y_list, dim=1)
     
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, y, attention_mask = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True), attention_mask.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
+        x, y, attention_mask = x.to(device), y.to(device), attention_mask.to(device)
 
-    return x, y
+    return x, y, attention_mask
 
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -294,7 +293,7 @@ for p in model.parameters():
 evolver_config = MemoryRobertaConfig(vocab_size=model_args['vocab_size'] + evolver_gpt2_token_id_offset, num_hidden_layers=evolver_n_layer,
                                      num_attention_heads=evolver_n_head, hidden_size=evolver_n_embd, max_position_embeddings=block_size, intermediate_size=evolver_n_intermediate,
                                      pad_token_id=evolver_pad_token_id, gpt2_token_id_offset=evolver_gpt2_token_id_offset, num_memory=evolver_n_mem,
-                                     num_target_model_layer=num_target_model_layer)
+                                     num_target_model_layer=num_target_model_layer, no_embeddings=True)
 evolver_model = MemoryRobertaModel(evolver_config)
 evolver_model.to(device)
 
@@ -357,7 +356,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_seq_train_batch(evolver_gpt2_token_id_offset) # fetch the very first batch
+X, Y, attention_mask = get_seq_train_batch() # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 # raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -404,6 +403,9 @@ while True:
     if iter_num == 0 and eval_only:
         break
     
+    lossf = 0.0
+    gpt_lossf = 0.0
+
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -414,6 +416,7 @@ while True:
 
         this_micro_X = X[batch_size*micro_step : batch_size*(1+micro_step)]
         this_micro_Y = Y[batch_size*micro_step : batch_size*(1+micro_step)]
+        this_micro_attention_mask = attention_mask[batch_size*micro_step : batch_size*(1+micro_step)]
 
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -422,42 +425,46 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             evolver_model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
+            target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
+
             past_segments_x = []
             past_segments_y = []
 
-            sampled_segments_index = set(random.sample(range(segment_num), max(int(segment_num * 0.4), 1)))
+            sampled_segments_index = set(random.sample(range(segment_num), max(int(segment_num * 0.5), 1)))
             trained_seg_num = segment_num + len(sampled_segments_index)
 
             for si in range(segment_num):
                 this_x = this_micro_X[:, si, :]
                 this_y = this_micro_Y[:, si, :]
-
-                x_padding_mask = this_x.ne(evolver_pad_token_id)
-                reverse_offset_matrix = this_x.new_full(this_x.shape, fill_value=-evolver_gpt2_token_id_offset) * x_padding_mask
-                no_offset_x = reverse_offset_matrix + this_x
+                this_attention_mask = this_micro_attention_mask[:, si, :]
 
                 # 保存数据用于复习
                 if si in sampled_segments_index:
-                    past_segments_x.append(no_offset_x)
+                    past_segments_x.append(this_x)
                     past_segments_y.append(this_y)
 
-                # X -> memory
-                this_attention_mask = x_padding_mask.int()
+                # generate embeddings by pretrained model
+                with torch.no_grad():
+                    output_embeds = model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
 
-                input_memory = evolver_model(input_ids=this_x, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
+                # X -> memory
+                input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
 
                 # last memory -> X
                 target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
 
-                _, loss = model(no_offset_x, this_y, target_model_parameter)
+                _, loss = model(this_x, this_y, target_model_parameter)
                 all_loss = loss / trained_seg_num + all_loss
 
+                # 参照RLHF，搞一个KL散度，防止与预训练模型偏离太严重。
+                # todo
+                
                 with torch.no_grad():
-                    _, loss = model(no_offset_x, this_y)
+                    _, loss = model(this_x, this_y)
                     gpt_loss = loss / trained_seg_num + gpt_loss
 
             # 复习一下past_segments
-            target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
+            # target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
 
             for (this_x, this_y) in zip(past_segments_x, past_segments_y):
                 _, loss = model(this_x, this_y, target_model_parameter)
@@ -471,12 +478,15 @@ while True:
             all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             gpt_loss = gpt_loss / gradient_accumulation_steps
 
+        lossf += all_loss.item()
+        gpt_lossf += gpt_loss.item()
+
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_seq_train_batch(evolver_gpt2_token_id_offset)
+        X, Y, attention_mask = get_seq_train_batch()
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(all_loss).backward()
 
-        input_memory_list[micro_step] = input_memory.detach()
+        # input_memory_list[micro_step] = input_memory.detach()
         input_memory_list[micro_step] = None
 
         # # 重启记忆
@@ -501,8 +511,6 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = all_loss.item() * gradient_accumulation_steps
-        gpt_lossf = gpt_loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
