@@ -4,7 +4,7 @@
 compile = False
 wandb_log = True
 wandb_project = 'mem'
-wandb_run_name='1st_share_embed_1_seg'
+wandb_run_name='2nd_predict_1_seg'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
@@ -13,7 +13,7 @@ init_from = 'gpt2'
 batch_size = 8
 block_size = 512
 min_block_size = 256
-gradient_accumulation_steps = 8
+gradient_accumulation_steps = 4
 
 # this makes total number of tokens be 300B
 max_iters = 600000
@@ -21,7 +21,7 @@ lr_decay_iters = 600000
 warmup_iters = 2000
 
 # eval stuff
-eval_interval = 50
+eval_interval = 100
 eval_iters = 1
 log_interval = 1
 

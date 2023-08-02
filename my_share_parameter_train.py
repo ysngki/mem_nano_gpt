@@ -170,13 +170,17 @@ for bi in range(0, actual_batch_size):
 
 
 # get data for a minibatch
-def get_seq_train_batch():
+def get_seq_train_batch(this_batch_seg_num, plus_one=False):
     data = train_data
 
     x_list = []
     y_list = []
 
-    for _ in range(segment_num):
+    fetch_seg_num = this_batch_seg_num
+    if plus_one:
+        fetch_seg_num += 1
+
+    for seg_index in range(fetch_seg_num):
         random_length = torch.randint(block_size - min_block_size, (actual_batch_size,)) # random segment len for each batch item
 
         for bi in range(actual_batch_size):
@@ -199,7 +203,10 @@ def get_seq_train_batch():
             padding_y[bi][:len(y[bi])] = y[bi]
 
             # update this_rank_batch_train_data_pointer
-            this_rank_batch_train_data_pointer[bi] = segment_ends[bi] if segment_ends[bi] < len(data) - min_block_size else 0
+            if seg_index == this_batch_seg_num:
+                pass
+            else:
+                this_rank_batch_train_data_pointer[bi] = segment_ends[bi] if segment_ends[bi] < len(data) - min_block_size else 0
 
         # return_offset_x.append(offset_padding_x)
         x_list.append(padding_x)
@@ -356,7 +363,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y, attention_mask = get_seq_train_batch() # fetch the very first batch
+X, Y, attention_mask = get_seq_train_batch(segment_num, True) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 # raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -404,12 +411,17 @@ while True:
         break
     
     lossf = 0.0
+    revise_lossf = 0.0
+    predict_lossf = 0.0
+
     gpt_lossf = 0.0
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         all_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        predict_loss = torch.tensor(0.0, device=device)
+        revise_loss = torch.tensor(0.0, device=device)
         gpt_loss = torch.tensor(0.0, device=device)
         
         input_memory = input_memory_list[micro_step]
@@ -431,12 +443,15 @@ while True:
             past_segments_y = []
 
             sampled_segments_index = set(random.sample(range(segment_num), max(int(segment_num * 0.5), 1)))
+            sampled_segments_index = []
             trained_seg_num = segment_num + len(sampled_segments_index)
 
+            # get data for first segment
+            this_x = this_micro_X[:, 0, :]
+            this_y = this_micro_Y[:, 0, :]
+            this_attention_mask = this_micro_attention_mask[:, 0, :]
+
             for si in range(segment_num):
-                this_x = this_micro_X[:, si, :]
-                this_y = this_micro_Y[:, si, :]
-                this_attention_mask = this_micro_attention_mask[:, si, :]
 
                 # 保存数据用于复习
                 if si in sampled_segments_index:
@@ -453,36 +468,54 @@ while True:
                 # last memory -> X
                 target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
 
-                _, loss = model(this_x, this_y, target_model_parameter)
-                all_loss = loss / trained_seg_num + all_loss
+                # _, loss = model(this_x, this_y, target_model_parameter)
+                # all_loss = loss + all_loss
+
+                # with torch.no_grad():
+                #     _, loss = model(this_x, this_y)
+                #     gpt_loss = loss + gpt_loss
 
                 # 参照RLHF，搞一个KL散度，防止与预训练模型偏离太严重。
                 # todo
                 
+                # get data for next segment
+                this_x = this_micro_X[:, si + 1, :]
+                this_y = this_micro_Y[:, si + 1, :]
+                this_attention_mask = this_micro_attention_mask[:, si + 1, :]
+
+                _, loss = model(this_x, this_y, target_model_parameter)
+                all_loss = loss + all_loss
+                predict_loss = loss + predict_loss
+
                 with torch.no_grad():
                     _, loss = model(this_x, this_y)
-                    gpt_loss = loss / trained_seg_num + gpt_loss
+                    gpt_loss = loss + gpt_loss
 
             # 复习一下past_segments
             # target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
 
             for (this_x, this_y) in zip(past_segments_x, past_segments_y):
                 _, loss = model(this_x, this_y, target_model_parameter)
-                all_loss = loss / trained_seg_num + all_loss
+                all_loss = loss + all_loss
+                revise_loss = loss + revise_loss
 
                 with torch.no_grad():
                     _, loss = model(this_x, this_y)
-                    gpt_loss = loss / trained_seg_num + gpt_loss
+                    gpt_loss = loss + gpt_loss
 
-            ### 
-            all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-            gpt_loss = gpt_loss / gradient_accumulation_steps
+            ###
+            all_loss = all_loss / (gradient_accumulation_steps * trained_seg_num) # scale the loss to account for gradient accumulation
+            revise_loss = revise_loss / (gradient_accumulation_steps * len(past_segments_x))
+            predict_loss = predict_loss / (gradient_accumulation_steps * segment_num)
+            gpt_loss = gpt_loss / (gradient_accumulation_steps * trained_seg_num)
 
-        lossf += all_loss.item()
-        gpt_lossf += gpt_loss.item()
+            lossf += all_loss.item()
+            revise_lossf += revise_loss.item()
+            predict_lossf += predict_loss.item()
+            gpt_lossf += gpt_loss.item()
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, attention_mask = get_seq_train_batch()
+        X, Y, attention_mask = get_seq_train_batch(segment_num, True)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(all_loss).backward()
 
@@ -519,6 +552,8 @@ while True:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": lossf,
+                "train/predict_loss": predict_lossf,
+                "train/revise_loss": revise_lossf,
                 "train/gpt_loss": gpt_lossf,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
