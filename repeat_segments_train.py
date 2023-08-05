@@ -33,6 +33,7 @@ from model import MemoryGPT as GPT
 from my_configuration_roberta import MemoryRobertaConfig
 from my_modeling_roberta import MemoryRobertaModel
 
+from my_utils import get_seq_train_batch
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a evolver (roberta)
@@ -63,7 +64,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume'
-pretrained_model = 'gpt2'
+pretrained_model_name = 'gpt2'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -75,6 +76,7 @@ batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch si
 block_size = 1024
 min_block_size = 50
 # model
+load_name = 'place_holder'
 n_layer = 12
 n_head = 12
 n_embd = 768
@@ -144,17 +146,6 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
 
 # get initial data pointer for each batch in this rank: this_rank_batch_train_data_pointer
 this_rank_train_data_start = ddp_rank * (len(train_data) // ddp_world_size)
@@ -170,59 +161,6 @@ actual_batch_size = batch_size * gradient_accumulation_steps
 for bi in range(0, actual_batch_size):
     this_rank_batch_train_data_pointer.append(this_rank_train_data_start + bi * (this_rank_data_num // actual_batch_size))
 
-
-# get data for a minibatch
-def get_seq_train_batch():
-    data = train_data
-
-    x_list = []
-    y_list = []
-
-    for _ in range(segment_num):
-        random_length = torch.randint(block_size - min_block_size, (actual_batch_size,)) # random segment len for each batch item
-
-        for bi in range(actual_batch_size):
-            this_end = random_length[bi] + min_block_size + this_rank_batch_train_data_pointer[bi] # end index
-            random_length[bi] = this_end if this_end < len(data) else len(data) - 1
-
-        segment_ends = random_length
-
-        # (batch size, xxx)
-        x = [torch.from_numpy((data[this_rank_batch_train_data_pointer[bi]:segment_ends[bi]]).astype(np.int64)) for bi in range(actual_batch_size)]
-        y = [torch.from_numpy((data[this_rank_batch_train_data_pointer[bi] + 1:segment_ends[bi] + 1]).astype(np.int64)) for bi in range(actual_batch_size)]
-
-        # padding to (batch size, block size)
-
-        padding_x = x[0].new_full((actual_batch_size, block_size), fill_value=0)
-        padding_y = y[0].new_full((actual_batch_size, block_size), fill_value=-1)
-
-        for bi in range(actual_batch_size):
-            padding_x[bi][:len(x[bi])] = x[bi] + 1
-            padding_y[bi][:len(y[bi])] = y[bi]
-
-            # update this_rank_batch_train_data_pointer
-            this_rank_batch_train_data_pointer[bi] = segment_ends[bi] if segment_ends[bi] < len(data) - min_block_size else 0
-
-        # return_offset_x.append(offset_padding_x)
-        x_list.append(padding_x)
-        y_list.append(padding_y)
-    
-    # (batch size, segment num, block size)
-    x = torch.stack(x_list, dim=1)
-    attention_mask = x.ne(0).int()
-    x = x + x.new_full(attention_mask.size(), fill_value=-1) * attention_mask # pad_token_id is 0
-
-    y = torch.stack(y_list, dim=1)
-    
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y, attention_mask = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True), attention_mask.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y, attention_mask = x.to(device), y.to(device), attention_mask.to(device)
-
-    return x, y, attention_mask
-
-
 # --------------------------------------------------------------------------
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -237,29 +175,30 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
-
 # load pretrained model
-if "gpt" in pretrained_model:
-    print(f"Initializing from OpenAI GPT-2 weights: {pretrained_model}")
+if "gpt" in pretrained_model_name:
+    print(f"Initializing from OpenAI GPT-2 weights: {pretrained_model_name}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(pretrained_model, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = getattr(model.config, k)
-    model.to(device)
+    pretrained_model = GPT.from_pretrained(pretrained_model_name, override_args)
+    pretrained_model.to(device)
     # backbone forzen
-    for p in model.parameters():
+    for p in pretrained_model.parameters():
         p.requires_grad_(False)
+    
+    pretrained_model_config = pretrained_model.config
 else:
-    raise Exception(f"Unrecognized pretrained model {pretrained_model}")
+    raise Exception(f"Unrecognized pretrained model {pretrained_model_name}")
 
 # --------------------------------------------------------------------------
 # create my evolver 
-if init_from == 'resume':
+if init_from == 'scratch':
+    evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size + evolver_gpt2_token_id_offset, num_hidden_layers=evolver_n_layer,
+                                        num_attention_heads=evolver_n_head, hidden_size=evolver_n_embd, max_position_embeddings=block_size, intermediate_size=evolver_n_intermediate,
+                                        pad_token_id=evolver_pad_token_id, gpt2_token_id_offset=evolver_gpt2_token_id_offset, num_memory=evolver_n_mem,
+                                        num_target_model_layer=num_target_model_layer, no_embeddings=True)
+    evolver_model = MemoryRobertaModel(evolver_config)
+elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint. 
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
@@ -277,12 +216,25 @@ if init_from == 'resume':
     evolver_model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
-elif init_from == 'scratch':
-    evolver_config = MemoryRobertaConfig(vocab_size=model_args['vocab_size'] + evolver_gpt2_token_id_offset, num_hidden_layers=evolver_n_layer,
+elif init_from == 'load':
+    evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size + evolver_gpt2_token_id_offset, num_hidden_layers=evolver_n_layer,
                                         num_attention_heads=evolver_n_head, hidden_size=evolver_n_embd, max_position_embeddings=block_size, intermediate_size=evolver_n_intermediate,
                                         pad_token_id=evolver_pad_token_id, gpt2_token_id_offset=evolver_gpt2_token_id_offset, num_memory=evolver_n_mem,
                                         num_target_model_layer=num_target_model_layer, no_embeddings=True)
     evolver_model = MemoryRobertaModel(evolver_config)
+
+    # resume training from a checkpoint. 
+    ckpt_path = os.path.join(out_dir, load_name)
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    state_dict = checkpoint['evolver_model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
+    evolver_model.load_state_dict(state_dict)
 else:
     raise Exception(f"Unrecognized init_from {init_from}")
 
@@ -301,8 +253,7 @@ checkpoint = None # free up memory
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    pretrained_model_config = torch.compile(pretrained_model_config) # requires PyTorch 2.0
     evolver_model = torch.compile(evolver_model) # requires PyTorch 2.0
 
 # wrap model into DDP container
@@ -313,18 +264,77 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
+def estimate_repeat_loss():
     out = {}
-    model.eval()
+    evolver_model.eval()
     for split in ['train', 'val']:
+        if split == 'train':
+            data = train_data
+        elif split == 'val':
+            data = val_data
+        else:
+            raise NotImplementedError
+        
         losses = torch.zeros(eval_iters)
+        gpt_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                _, loss = model(X, Y)
-            losses[k] = loss.item()
+            this_iter_loss = torch.tensor(0.0, device=device)
+            this_iter_gpt_loss = torch.tensor(0.0, device=device)
+
+            # random start
+            random_data_start_pointer = []
+            for _ in range(0, actual_batch_size):
+                random_data_start_pointer.append(random.randint(0, len(data) - block_size * segment_num - 1))
+
+            # fetch data for this batch
+            random_data_start_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(data, random_data_start_pointer, segment_num, block_size, min_block_size, device, device_type) # fetch the very first batch
+
+            # empty memory
+            input_memory_list = [None for _ in range(gradient_accumulation_steps)]
+
+            for micro_step in range(gradient_accumulation_steps):
+                this_micro_X = X[batch_size*micro_step : batch_size*(1+micro_step)]
+                this_micro_Y = Y[batch_size*micro_step : batch_size*(1+micro_step)]
+                this_micro_attention_mask = attention_mask[batch_size*micro_step : batch_size*(1+micro_step)]
+                this_micro_seg_length_list = seg_length_list[:, batch_size*micro_step : batch_size*(1+micro_step)] # (seg num, micro batch size)
+
+                # get memory of last step
+                input_memory = input_memory_list[micro_step]
+
+                target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
+                
+                for si in range(segment_num):
+                    # get data
+                    this_x = this_micro_X[:, si, :]
+                    this_y = this_micro_Y[:, si, :]
+                    this_attention_mask = this_micro_attention_mask[:, si, :]
+                    this_seg_len = this_micro_seg_length_list[si]
+
+                    # ----------------------------------------------
+                    output_embeds = pretrained_model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
+
+                    # X -> memory
+                    input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
+
+                    # last memory -> X
+                    target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
+                    # ----------------------------------------------
+
+                    # predict next segment with memory
+                    _, loss = pretrained_model(this_x, this_y, target_model_parameter)
+                    this_iter_loss = loss + this_iter_loss
+
+                    _, gpt_loss  = pretrained_model(this_x, this_y)
+                    this_iter_gpt_loss = gpt_loss + this_iter_gpt_loss
+
+            this_iter_loss = this_iter_loss / (gradient_accumulation_steps * segment_num)
+            this_iter_gpt_loss = this_iter_gpt_loss / (gradient_accumulation_steps * segment_num)
+
+            losses[k] = this_iter_loss.item()
+            gpt_losses[k] = this_iter_gpt_loss.item()
         out[split] = losses.mean()
-    model.train()
+        out[split + "_gpt"] = gpt_losses.mean()
+    evolver_model.train()
     return out
 
 # learning rate decay scheduler (cosine with warmup)
@@ -347,11 +357,11 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config, notes=wandb_notes)
 
 # training loop
-X, Y, attention_mask = get_seq_train_batch() # fetch the very first batch
+this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type) # fetch the very first batch
+
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 # raw_model = model.module if ddp else model # unwrap DDP container if needed
-raw_model = model
 raw_evolver_model = evolver_model.module if ddp else evolver_model # unwrap DDP container if needed
 running_mfu = -1.0
 
@@ -366,25 +376,26 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
+        losses = estimate_repeat_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        # if wandb_log:
-        #     wandb.log({
-        #         "iter": iter_num,
-        #         "train/loss": losses['train'],
-        #         "val/loss": losses['val'],
-        #         "lr": lr,
-        #         "mfu": running_mfu*100, # convert to percentage
-        #     })
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "val/train_loss": losses['train'],
+                "val/val_loss": losses['val'],
+                "val/train_gpt_loss": losses['train_gpt'],
+                "val/val_gpt_loss": losses['val_gpt'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
                     'evolver_model': raw_evolver_model.state_dict(),
                     'evolver_config': evolver_config,
                     'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
+                    'pretrained_model_config': pretrained_model_config,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
@@ -445,7 +456,7 @@ while True:
 
                 # generate embeddings by pretrained model
                 with torch.no_grad():
-                    output_embeds = model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
+                    output_embeds = pretrained_model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
 
                 # X -> memory
                 input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
@@ -453,22 +464,22 @@ while True:
                 target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
                 
                 # last memory -> X
-                _, loss = model(this_x, this_y, target_model_parameter)
+                _, loss = pretrained_model(this_x, this_y, target_model_parameter)
                 all_loss = loss / trained_seg_num + all_loss
                 repeat_loss = loss / segment_num + repeat_loss
 
                 with torch.no_grad():
-                    _, loss = model(this_x, this_y)
+                    _, loss = pretrained_model(this_x, this_y)
                     gpt_loss = loss / trained_seg_num + gpt_loss
 
             # 复习一下past_segments
             for (this_x, this_y) in zip(past_segments_x, past_segments_y):
-                _, loss = model(this_x, this_y, target_model_parameter)
+                _, loss = pretrained_model(this_x, this_y, target_model_parameter)
                 all_loss = loss / trained_seg_num + all_loss
                 revise_loss = loss / len(past_segments_x) + revise_loss
 
                 with torch.no_grad():
-                    _, loss = model(this_x, this_y)
+                    _, loss = pretrained_model(this_x, this_y)
                     gpt_loss = loss / trained_seg_num + gpt_loss
 
             ### 
@@ -485,7 +496,7 @@ while True:
         revise_lossf += revise_loss.item()
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y, attention_mask = get_seq_train_batch()
+        this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(all_loss).backward()
 
@@ -500,7 +511,7 @@ while True:
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        torch.nn.utils.clip_grad_norm_(evolver_model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
@@ -515,7 +526,7 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            mfu = evolver_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, gpt_loss {gpt_lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         if wandb_log:

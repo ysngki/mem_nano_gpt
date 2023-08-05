@@ -8,7 +8,7 @@ wandb_run_name='1st_repeat_4_seg'
 wandb_notes='读取4个句子，读一个复述一个，最后一次性全部复述出来。'
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-pretrained_model = 'gpt2'
+pretrained_model_name = 'gpt2'
 init_from = 'scratch' # 'scratch' or 'resume'
 
 batch_size = 8
@@ -16,6 +16,8 @@ block_size = 512
 min_block_size = 256
 gradient_accumulation_steps = 8
 gpu_num = 2
+
+always_save_checkpoint = False
 
 # this makes total number of tokens be 300B
 max_iters = 600000

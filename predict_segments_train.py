@@ -34,6 +34,7 @@ from model import MemoryGPT as GPT
 from my_configuration_roberta import MemoryRobertaConfig
 from my_modeling_roberta import MemoryRobertaModel
 
+from my_utils import get_seq_train_batch
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a evolver (roberta)
@@ -147,17 +148,6 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
 
 # get initial data pointer for each batch in this rank: this_rank_batch_train_data_pointer
 this_rank_train_data_start = ddp_rank * (len(train_data) // ddp_world_size)
@@ -172,80 +162,6 @@ this_rank_batch_train_data_pointer = []
 actual_batch_size = batch_size * gradient_accumulation_steps
 for bi in range(0, actual_batch_size):
     this_rank_batch_train_data_pointer.append(this_rank_train_data_start + bi * (this_rank_data_num // actual_batch_size))
-
-
-# get data for a minibatch
-def get_seq_train_batch(data, data_pointer, this_batch_seg_num, plus_one=False):
-    x_list = []
-    y_list = []
-    seg_length_list = []
-
-    this_batch_size = len(data_pointer)
-
-    def get_x_y_tensor_list(batch_start_point, no_update=False):
-        # random segment len for each batch item
-        random_length = torch.randint(block_size - min_block_size, (this_batch_size,)) + min_block_size
-        segment_ends = random_length.clone()
-
-        for bi in range(this_batch_size):
-            this_end = random_length[bi] + batch_start_point[bi] # end index
-            segment_ends[bi] = this_end if this_end < len(data) else len(data) - 1
-            random_length[bi] = segment_ends[bi] - batch_start_point[bi] # actual length
-
-        # (batch size, xxx)
-        x = [torch.from_numpy((data[batch_start_point[bi]:segment_ends[bi]]).astype(np.int64)) for bi in range(this_batch_size)]
-        y = [torch.from_numpy((data[batch_start_point[bi] + 1:segment_ends[bi] + 1]).astype(np.int64)) for bi in range(this_batch_size)]
-
-        # update batch_start_point
-        if no_update:
-            pass
-        else:
-            for bi in range(this_batch_size):
-                batch_start_point[bi] = segment_ends[bi] if segment_ends[bi] < len(data) - min_block_size * segment_num else 0
-
-        return x, y, batch_start_point, random_length
-    
-
-    fetch_seg_num = this_batch_seg_num + 1 if plus_one else this_batch_seg_num
-
-    for seg_index in range(fetch_seg_num):
-        # get data for this segment
-        if seg_index == this_batch_seg_num: # plus one segment for prediction
-            this_x, this_y, data_pointer, this_seg_length = get_x_y_tensor_list(data_pointer, True)
-        else:
-            this_x, this_y, data_pointer, this_seg_length = get_x_y_tensor_list(data_pointer)
-
-        seg_length_list.append(this_seg_length)
-
-        # padding to (batch size, block size)
-        padding_x = this_x[0].new_full((this_batch_size, block_size), fill_value=0)
-        padding_y = this_y[0].new_full((this_batch_size, block_size), fill_value=-1)
-
-        for bi in range(this_batch_size):
-            padding_x[bi][:len(this_x[bi])] = this_x[bi]
-            padding_y[bi][:len(this_y[bi])] = this_y[bi]
-
-        # return_offset_x.append(offset_padding_x)
-        x_list.append(padding_x)
-        y_list.append(padding_y)
-    
-    # (actual batch size, segment num, block size)
-    x = torch.stack(x_list, dim=1)
-    y = torch.stack(y_list, dim=1)
-    attention_mask = y.ne(-1).int()
-    
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y, attention_mask = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True), attention_mask.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y, attention_mask = x.to(device), y.to(device), attention_mask.to(device)
-    
-    # (segment num, actual batch size)
-    seg_length_list = torch.stack(seg_length_list, dim=0)
-
-    # seg_length_list: (segment num, actual batch size); x,y,attention_mask shape: (actual batch size, segment num, block size)
-    return data_pointer, x, y, attention_mask, seg_length_list
-
 
 # --------------------------------------------------------------------------
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -357,22 +273,6 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
-    out = {}
-    pretrained_model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                _, loss = pretrained_model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    pretrained_model.train()
-    return out
-
-
-@torch.no_grad()
 def estimate_predict_loss():
     out = {}
     evolver_model.eval()
@@ -396,7 +296,7 @@ def estimate_predict_loss():
                 random_data_start_pointer.append(random.randint(0, len(data) - block_size * segment_num - 1))
 
             # fetch data for this batch
-            random_data_start_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(data, random_data_start_pointer, segment_num, True) # fetch the very first batch
+            random_data_start_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(data, random_data_start_pointer, segment_num, block_size, min_block_size, device, device_type, True) # fetch the very first batch
 
             # empty memory
             input_memory_list = [None for _ in range(gradient_accumulation_steps)]
@@ -477,7 +377,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config, notes=wandb_notes)
 
 # training loop
-this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, True) # fetch the very first batch
+this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type, True) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_evolver_model = evolver_model.module if ddp else evolver_model # unwrap DDP container if needed
@@ -686,7 +586,7 @@ while True:
             context_gpt_lossf += context_gpt_loss.item()
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, True)
+        this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type, True)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(all_loss).backward()
 
