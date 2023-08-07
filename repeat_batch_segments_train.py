@@ -27,7 +27,6 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-import torch.nn.functional as F
 
 from model import GPTConfig
 from model import MemoryGPT as GPT
@@ -86,6 +85,7 @@ n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
+memory_lr = 1.0 # learning rate for the memory module
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
@@ -207,12 +207,6 @@ elif "llama" in pretrained_model_name:
 else:
     raise Exception(f"Unrecognized pretrained model {pretrained_model_name}")
 
-pretrained_model.to(device)
-
-# backbone forzen
-for p in pretrained_model.parameters():
-    p.requires_grad_(False)
-
 # --------------------------------------------------------------------------
 # create my evolver 
 if init_from == 'scratch':
@@ -229,7 +223,7 @@ elif init_from == 'resume':
     evolver_config = checkpoint['evolver_config']
     # create the model
     evolver_model = MemoryRobertaModel(evolver_config)
-    state_dict = checkpoint['evolver_model']
+    state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
@@ -258,6 +252,8 @@ elif init_from == 'load':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 
     evolver_model.load_state_dict(state_dict)
+else:
+    raise Exception(f"Unrecognized init_from {init_from}")
 
 evolver_model.to(device)
 
@@ -266,7 +262,8 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = evolver_model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-input_memory_list = [None for i in range(gradient_accumulation_steps)]
+# input_memory_list = [raw_evolver_model.initial_memory.data.detach().clone() for _ in range(gradient_accumulation_steps)]
+input_memory_list = [None for _ in range(gradient_accumulation_steps)]
 
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -288,7 +285,7 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_predict_loss():
+def estimate_repeat_loss():
     out = {}
     evolver_model.eval()
     for split in ['train', 'val']:
@@ -302,6 +299,9 @@ def estimate_predict_loss():
         losses = torch.zeros(eval_iters)
         gpt_losses = torch.zeros(eval_iters)
         segment_losses = torch.zeros((segment_num, eval_iters))
+
+        inner_input_memory_list = [None for _ in range(gradient_accumulation_steps)]
+
         for k in range(eval_iters):
             this_iter_loss = torch.tensor(0.0, device=device)
             this_iter_gpt_loss = torch.tensor(0.0, device=device)
@@ -313,10 +313,7 @@ def estimate_predict_loss():
                 random_data_start_pointer.append(random.randint(0, len(data) - block_size * segment_num - 1))
 
             # fetch data for this batch
-            random_data_start_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(data, random_data_start_pointer, segment_num, block_size, min_block_size, device, device_type, True) # fetch the very first batch
-
-            # empty memory
-            input_memory_list = [None for _ in range(gradient_accumulation_steps)]
+            random_data_start_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(data, random_data_start_pointer, segment_num, block_size, min_block_size, device, device_type) # fetch the very first batch
 
             for micro_step in range(gradient_accumulation_steps):
                 this_micro_X = X[batch_size*micro_step : batch_size*(1+micro_step)]
@@ -324,45 +321,42 @@ def estimate_predict_loss():
                 this_micro_attention_mask = attention_mask[batch_size*micro_step : batch_size*(1+micro_step)]
                 this_micro_seg_length_list = seg_length_list[:, batch_size*micro_step : batch_size*(1+micro_step)] # (seg num, micro batch size)
 
-                # get data for first segment
-                this_x = this_micro_X[:, 0, :]
-                this_y = this_micro_Y[:, 0, :]
-                this_attention_mask = this_micro_attention_mask[:, 0, :]
-                this_seg_len = this_micro_seg_length_list[0]
-
                 # get memory of last step
-                input_memory = input_memory_list[micro_step]
+                input_memory = inner_input_memory_list[micro_step]
+                if input_memory is None:
+                    input_memory = raw_evolver_model.initial_memory
 
-                target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
-                
                 for si in range(segment_num):
-                    output_embeds = pretrained_model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
+                    # get data
+                    this_x = this_micro_X[:, si, :]
+                    this_y = this_micro_Y[:, si, :]
+                    this_attention_mask = this_micro_attention_mask[:, si, :]
+                    this_seg_len = this_micro_seg_length_list[si]
+
+                    batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
+
+                    # ----------------------------------------------
+                    output_embeds = pretrained_model(idx=this_x, output_embeds=True)
 
                     # X -> memory
-                    input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
-
-                    # last memory -> X
-                    target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
-
-                    # get data for next segment
-                    next_x = this_micro_X[:, si + 1, :]
-                    next_y = this_micro_Y[:, si + 1, :]
-                    next_attention_mask = this_micro_attention_mask[:, si + 1, :]
-                    next_seg_len = this_micro_seg_length_list[si+1]
+                    new_batch_input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=batch_input_memory)["memory_output"]
+                    
+                    # update memory by aggreaget delta memory of multiple samples
+                    delta_batch_input_memory = new_batch_input_memory - batch_input_memory # (batch_size, memory_size, hidden_size)
+                    delta_input_memory = delta_batch_input_memory.mean(dim=0) # (memory_size, hidden_size) # todo: mean or sum or other?
+                    input_memory = input_memory + delta_input_memory * memory_lr
+                    
+                    # generate parameters for prediction for each segment
+                    target_model_parameter = evolver_model(input_memory=new_batch_input_memory, produce_parameter_flag=True) # (layer num, batch size, memory size, hidden size)
+                    # ----------------------------------------------
 
                     # predict next segment with memory
-                    _, loss = pretrained_model(next_x, next_y, target_model_parameter)
+                    _, loss = pretrained_model(this_x, this_y, target_model_parameter)
                     this_iter_loss = loss + this_iter_loss
                     this_iter_segment_loss[si] = loss + this_iter_segment_loss[si]
 
-                    _, gpt_loss  = pretrained_model(next_x, next_y)
+                    _, gpt_loss  = pretrained_model(this_x, this_y)
                     this_iter_gpt_loss = gpt_loss + this_iter_gpt_loss
-
-                    # assignment
-                    this_x = next_x
-                    this_y = next_y
-                    this_attention_mask = next_attention_mask
-                    this_seg_len = next_seg_len
 
             this_iter_loss = this_iter_loss / (gradient_accumulation_steps * segment_num)
             this_iter_gpt_loss = this_iter_gpt_loss / (gradient_accumulation_steps * segment_num)
@@ -377,7 +371,6 @@ def estimate_predict_loss():
         out[split + "_segment"] = segment_losses.mean(dim=1).tolist()
     evolver_model.train()
     return out
-
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -402,9 +395,10 @@ if wandb_log and master_process:
     wandb.init(id=wandb_id, resume='allow', project=wandb_project, name=wandb_run_name, config=config, notes=wandb_notes)
 
 # training loop
-this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type, True) # fetch the very first batch
+this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
+# raw_model = model.module if ddp else model # unwrap DDP container if needed
 raw_evolver_model = evolver_model.module if ddp else evolver_model # unwrap DDP container if needed
 running_mfu = -1.0
 
@@ -417,7 +411,7 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_predict_loss()
+        losses = estimate_repeat_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             log_data = {
@@ -452,37 +446,28 @@ while True:
     if iter_num == 0 and eval_only:
         break
     
-    # record loss in this iteration
-    evolver_model.train()
-    pretrained_model.eval()
-
     lossf = 0.0
     gpt_lossf = 0.0
 
-    predict_lossf = 0.0
+    repeat_lossf = 0.0
     revise_lossf = 0.0
-    all_kl_lossf = 0.0
-    context_gpt_lossf = 0.0
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        # record loss in this micro step
         all_loss = torch.tensor(0.0, device=device, requires_grad=True)
         gpt_loss = torch.tensor(0.0, device=device)
-
-        predict_loss = torch.tensor(0.0, device=device)
-        revise_loss = torch.tensor(0.0, device=device)
-        all_kl_loss = torch.tensor(0.0, device=device)
-        context_gpt_loss = torch.tensor(0.0, device=device)
         
-        # get memory of last step
+        repeat_loss = torch.tensor(0.0, device=device)
+        revise_loss = torch.tensor(0.0, device=device)
+        
         input_memory = input_memory_list[micro_step]
+        if input_memory is None:
+            input_memory = raw_evolver_model.initial_memory
 
         this_micro_X = X[batch_size*micro_step : batch_size*(1+micro_step)]
         this_micro_Y = Y[batch_size*micro_step : batch_size*(1+micro_step)]
         this_micro_attention_mask = attention_mask[batch_size*micro_step : batch_size*(1+micro_step)]
-        this_micro_seg_length_list = seg_length_list[:, batch_size*micro_step : batch_size*(1+micro_step)] # (seg num, micro batch size)
 
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -494,128 +479,79 @@ while True:
             past_segments_x = []
             past_segments_y = []
 
-            sampled_segments_index = set(random.sample(range(segment_num), max(int(segment_num * 0.5), 1)))
-            sampled_segments_index = []
+            # sampled_segments_index = set(random.sample(range(segment_num), max(int(segment_num * 0.5), 1)))
+            # trained_seg_num = segment_num + len(sampled_segments_index)
+
+            sampled_segments_index = set(range(segment_num))
             trained_seg_num = segment_num + len(sampled_segments_index)
 
-            # get data for first segment
-            this_x = this_micro_X[:, 0, :]
-            this_y = this_micro_Y[:, 0, :]
-            this_attention_mask = this_micro_attention_mask[:, 0, :]
-            this_seg_len = this_micro_seg_length_list[0]
-
-            # generate parameters for first segment
-            with torch.no_grad():
-                target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
-
             for si in range(segment_num):
+                batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
+
+                this_x = this_micro_X[:, si, :]
+                this_y = this_micro_Y[:, si, :]
+                this_attention_mask = this_micro_attention_mask[:, si, :]
+
                 # 保存数据用于复习
                 if si in sampled_segments_index:
                     past_segments_x.append(this_x)
                     past_segments_y.append(this_y)
 
-                # read this segment and update memory ------------------------------------------
-                # generate input embeddings by pretrained model
+                # generate embeddings by pretrained model
                 with torch.no_grad():
-                    output_embeds = pretrained_model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
+                    output_embeds = pretrained_model(idx=this_x, output_embeds=True)
 
                 # X -> memory
-                input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
-                #--------------------------------------------------------------
+                new_batch_input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=batch_input_memory)["memory_output"]
 
-                last_target_model_parameter = target_model_parameter
+                # update memory by aggreaget delta memory of multiple samples
+                delta_batch_input_memory = new_batch_input_memory - batch_input_memory # (batch_size, memory_size, hidden_size)
+                delta_input_memory = delta_batch_input_memory.mean(dim=0) # (memory_size, hidden_size) # todo: mean or sum or other?
+                input_memory = input_memory + delta_input_memory * memory_lr
+                
+                # generate parameters for prediction for each segment
+                target_model_parameter = evolver_model(input_memory=new_batch_input_memory, produce_parameter_flag=True) # (layer num, batch size, memory size, hidden size)
 
                 # last memory -> X
-                target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
-
-                # get data for next segment
-                next_x = this_micro_X[:, si + 1, :]
-                next_y = this_micro_Y[:, si + 1, :]
-                next_attention_mask = this_micro_attention_mask[:, si + 1, :]
-                next_seg_len = this_micro_seg_length_list[si+1]
-
-                # predict next segment with memory
-                logits_with_memory, loss = pretrained_model(next_x, next_y, target_model_parameter)
-                all_loss = loss + all_loss
-                predict_loss = loss + predict_loss
-
-                # reference
-                with torch.no_grad():
-                    _, loss = pretrained_model(next_x, next_y)
-                    gpt_loss = loss + gpt_loss
-
-                #############################
-                # select vaild logits (non-padding) from logits_with_memory for kl divergence
-                logits_with_memory = logits_with_memory.view(-1, logits_with_memory.shape[-1]) # shape=(batch_size*seq_len, vocab_size)
-                logits_with_memory = logits_with_memory[next_attention_mask.reshape(-1) == 1] # shape=(non-padding, vocab_size)
-
-                # predict with context (teacher) and last memory
-                with torch.no_grad():
-                    bsz = this_x.shape[0]
-                    two_seg_block_size = this_x.shape[1] + next_x.shape[1]
-
-                    # concatenate two segments to get context
-                    x_container = this_x.new_full((bsz, two_seg_block_size), fill_value=0)
-                    for bi in range(bsz):
-                        x_container[bi, :this_seg_len[bi]] = this_x[bi, :this_seg_len[bi]]
-                        x_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_x[bi, :next_seg_len[bi]]
-                    
-                    y_container = this_y.new_full(x_container.size(), fill_value=-1)
-                    next_segment_mask = next_attention_mask.new_full(x_container.size(), fill_value=0)
-                    for bi in range(bsz):
-                        y_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_y[bi, :next_seg_len[bi]]
-
-                        next_segment_mask[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = 1
-                    
-                    # predict
-                    logits_with_context, loss = pretrained_model(x_container, y_container, last_target_model_parameter) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
-                    context_gpt_loss = loss + context_gpt_loss
-                
-                # select logits of second segment from logits_with_context
-                logits_with_context = logits_with_context.view(-1, logits_with_context.shape[-1]) # shape=(batch_size*two_seg_block_size, vocab_size)
-                logits_with_context = logits_with_context[next_segment_mask.view(-1) == 1] # shape=(non-padding, vocab_size)
-                
-                # calculate KL divergence between logits_with_memory and logits_with_context
-                kl_loss = F.kl_div(F.log_softmax(logits_with_memory, dim=-1), F.softmax(logits_with_context, dim=-1), reduction='batchmean')
-                #############################
-                all_loss = kl_loss + all_loss
-                all_kl_loss = kl_loss + all_kl_loss
-
-                # assignment
-                this_x = next_x
-                this_y = next_y
-                this_attention_mask = next_attention_mask
-                this_seg_len = next_seg_len
-
-            # 复习一下past_segments
-            for (this_x, this_y) in zip(past_segments_x, past_segments_y):
                 _, loss = pretrained_model(this_x, this_y, target_model_parameter)
-                all_loss = loss + all_loss
-                revise_loss = loss + revise_loss
+                all_loss = loss / trained_seg_num + all_loss
+                repeat_loss = loss / segment_num + repeat_loss
 
                 with torch.no_grad():
                     _, loss = pretrained_model(this_x, this_y)
-                    gpt_loss = loss + gpt_loss
+                    gpt_loss = loss / trained_seg_num + gpt_loss
 
-            ###
-            all_loss = all_loss / (gradient_accumulation_steps * trained_seg_num) # scale the loss to account for gradient accumulation
-            gpt_loss = gpt_loss / (gradient_accumulation_steps * trained_seg_num)
+            if len(past_segments_x) > 0:
+                batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
+                target_model_parameter = evolver_model(input_memory=batch_input_memory, produce_parameter_flag=True)
 
-            predict_loss = predict_loss / (gradient_accumulation_steps * segment_num)
-            revise_loss = revise_loss / (gradient_accumulation_steps * len(past_segments_x))
-            all_kl_loss = all_kl_loss / (gradient_accumulation_steps * segment_num)
-            context_gpt_loss = context_gpt_loss / (gradient_accumulation_steps * segment_num)
+            # 复习一下past_segments
+            for (this_x, this_y) in zip(past_segments_x, past_segments_y):
+                # todo 
+                # add kl to avoid forgetting
+                _, loss = pretrained_model(this_x, this_y, target_model_parameter)
+                all_loss = loss / trained_seg_num + all_loss
+                revise_loss = loss / len(past_segments_x) + revise_loss
 
-            lossf += all_loss.item()
-            gpt_lossf += gpt_loss.item()
+                with torch.no_grad():
+                    _, loss = pretrained_model(this_x, this_y)
+                    gpt_loss = loss / trained_seg_num + gpt_loss
 
-            predict_lossf += predict_loss.item()
-            revise_lossf += revise_loss.item()
-            all_kl_lossf += all_kl_loss.item()
-            context_gpt_lossf += context_gpt_loss.item()
+            ### 
+            all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            gpt_loss = gpt_loss / gradient_accumulation_steps
+
+            repeat_loss = repeat_loss / gradient_accumulation_steps
+            revise_loss = revise_loss / gradient_accumulation_steps
+
+        lossf += all_loss.item()
+        gpt_lossf += gpt_loss.item()
+
+        repeat_lossf += repeat_loss.item()
+        revise_lossf += revise_loss.item()
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type, True)
+        this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(all_loss).backward()
 
@@ -652,11 +588,9 @@ while True:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": lossf,
-                "train/predict_loss": predict_lossf,
-                "train/revise_loss": revise_lossf,
-                "train/context_gpt_loss": context_gpt_lossf,
-                "train/all_kl_loss": all_kl_lossf,
                 "train/gpt_loss": gpt_lossf,
+                "train/repeat_loss": repeat_lossf,
+                "train/revise_loss": revise_lossf,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
