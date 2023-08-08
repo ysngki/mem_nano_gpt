@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.nn.functional as F
 
 from model import GPTConfig
 from model import MemoryGPT as GPT
@@ -223,7 +224,7 @@ elif init_from == 'resume':
     evolver_config = checkpoint['evolver_config']
     # create the model
     evolver_model = MemoryRobertaModel(evolver_config)
-    state_dict = checkpoint['model']
+    state_dict = checkpoint['evolver_model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
@@ -299,6 +300,7 @@ def estimate_repeat_loss():
         losses = torch.zeros(eval_iters)
         gpt_losses = torch.zeros(eval_iters)
         segment_losses = torch.zeros((segment_num, eval_iters))
+        losses_after_reduce = torch.zeros(eval_iters)
 
         inner_input_memory_list = [None for _ in range(gradient_accumulation_steps)]
 
@@ -306,6 +308,7 @@ def estimate_repeat_loss():
             this_iter_loss = torch.tensor(0.0, device=device)
             this_iter_gpt_loss = torch.tensor(0.0, device=device)
             this_iter_segment_loss = torch.zeros((segment_num, ), device=device)
+            this_iter_loss_after_reduce = torch.tensor(0.0, device=device)
 
             # random start
             random_data_start_pointer = []
@@ -326,6 +329,8 @@ def estimate_repeat_loss():
                 if input_memory is None:
                     input_memory = raw_evolver_model.initial_memory
 
+                batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
+
                 for si in range(segment_num):
                     # get data
                     this_x = this_micro_X[:, si, :]
@@ -333,24 +338,16 @@ def estimate_repeat_loss():
                     this_attention_mask = this_micro_attention_mask[:, si, :]
                     this_seg_len = this_micro_seg_length_list[si]
 
-                    batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
-
                     # ----------------------------------------------
                     output_embeds = pretrained_model(idx=this_x, output_embeds=True)
 
                     # X -> memory
                     new_batch_input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=batch_input_memory)["memory_output"]
                     
-                    # update memory by aggreaget delta memory of multiple samples
-                    delta_batch_input_memory = new_batch_input_memory - batch_input_memory # (batch_size, memory_size, hidden_size)
-                    delta_input_memory = delta_batch_input_memory.mean(dim=0) # (memory_size, hidden_size) # todo: mean or sum or other?
-                    input_memory = input_memory + delta_input_memory * memory_lr
-                    
                     # generate parameters for prediction for each segment
                     target_model_parameter = evolver_model(input_memory=new_batch_input_memory, produce_parameter_flag=True) # (layer num, batch size, memory size, hidden size)
-                    # ----------------------------------------------
 
-                    # predict next segment with memory
+                    # repeat this segment with corresponding memory
                     _, loss = pretrained_model(this_x, this_y, target_model_parameter)
                     this_iter_loss = loss + this_iter_loss
                     this_iter_segment_loss[si] = loss + this_iter_segment_loss[si]
@@ -358,17 +355,31 @@ def estimate_repeat_loss():
                     _, gpt_loss  = pretrained_model(this_x, this_y)
                     this_iter_gpt_loss = gpt_loss + this_iter_gpt_loss
 
+                    # update memory by aggreaget delta memory of multiple samples
+                    delta_batch_input_memory = new_batch_input_memory - batch_input_memory # (batch_size, memory_size, hidden_size)
+                    delta_input_memory = delta_batch_input_memory.mean(dim=0) # (memory_size, hidden_size) # todo: mean or sum or other?
+                    input_memory = input_memory + delta_input_memory * memory_lr
+                    batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
+
+                    # repeat after reduce
+                    target_model_parameter = evolver_model(input_memory=batch_input_memory, produce_parameter_flag=True)
+                    _, loss = pretrained_model(this_x, this_y, target_model_parameter)
+                    this_iter_loss_after_reduce = loss + this_iter_loss_after_reduce
+
             this_iter_loss = this_iter_loss / (gradient_accumulation_steps * segment_num)
             this_iter_gpt_loss = this_iter_gpt_loss / (gradient_accumulation_steps * segment_num)
             this_iter_segment_loss = this_iter_segment_loss / gradient_accumulation_steps
+            this_iter_loss_after_reduce = this_iter_loss_after_reduce / (gradient_accumulation_steps * segment_num)
 
             losses[k] = this_iter_loss.item()
             gpt_losses[k] = this_iter_gpt_loss.item()
             segment_losses[:, k] = this_iter_segment_loss
+            losses_after_reduce[k] = this_iter_loss_after_reduce.item()
 
         out[split] = losses.mean()
         out[split + "_gpt"] = gpt_losses.mean()
         out[split + "_segment"] = segment_losses.mean(dim=1).tolist()
+        out[split + "_after_reduce"] = losses_after_reduce.mean()
     evolver_model.train()
     return out
 
@@ -418,6 +429,8 @@ while True:
                 "iter": iter_num,
                 "val/train_loss": losses['train'],
                 "val/val_loss": losses['val'],
+                "val/train_loss_after_reduce": losses['train_after_reduce'],
+                "val/val_loss_after_reduce": losses['val_after_reduce'],
                 "val/train_gpt_loss": losses['train_gpt'],
                 "val/val_gpt_loss": losses['val_gpt'],
                 "lr": lr,
@@ -451,6 +464,8 @@ while True:
 
     repeat_lossf = 0.0
     revise_lossf = 0.0
+    kl_lossf = 0.0
+    after_reduce_repeat_lossf = 0.0
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -460,10 +475,13 @@ while True:
         
         repeat_loss = torch.tensor(0.0, device=device)
         revise_loss = torch.tensor(0.0, device=device)
+        kl_loss = torch.tensor(0.0, device=device)
+        after_reduce_repeat_loss = torch.tensor(0.0, device=device)
         
         input_memory = input_memory_list[micro_step]
         if input_memory is None:
             input_memory = raw_evolver_model.initial_memory
+        batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
 
         this_micro_X = X[batch_size*micro_step : batch_size*(1+micro_step)]
         this_micro_Y = Y[batch_size*micro_step : batch_size*(1+micro_step)]
@@ -486,7 +504,6 @@ while True:
             trained_seg_num = segment_num + len(sampled_segments_index)
 
             for si in range(segment_num):
-                batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
 
                 this_x = this_micro_X[:, si, :]
                 this_y = this_micro_Y[:, si, :]
@@ -504,38 +521,54 @@ while True:
                 # X -> memory
                 new_batch_input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=batch_input_memory)["memory_output"]
 
-                # update memory by aggreaget delta memory of multiple samples
-                delta_batch_input_memory = new_batch_input_memory - batch_input_memory # (batch_size, memory_size, hidden_size)
-                delta_input_memory = delta_batch_input_memory.mean(dim=0) # (memory_size, hidden_size) # todo: mean or sum or other?
-                input_memory = input_memory + delta_input_memory * memory_lr
-                
                 # generate parameters for prediction for each segment
                 target_model_parameter = evolver_model(input_memory=new_batch_input_memory, produce_parameter_flag=True) # (layer num, batch size, memory size, hidden size)
 
                 # last memory -> X
-                _, loss = pretrained_model(this_x, this_y, target_model_parameter)
-                all_loss = loss / trained_seg_num + all_loss
+                logits_before_reduce, loss = pretrained_model(this_x, this_y, target_model_parameter)
+                all_loss = loss / segment_num + all_loss
                 repeat_loss = loss / segment_num + repeat_loss
+
+                # update memory by aggreaget delta memory of multiple samples
+                delta_batch_input_memory = new_batch_input_memory - batch_input_memory # (batch_size, memory_size, hidden_size)
+                delta_input_memory = delta_batch_input_memory.mean(dim=0) # (memory_size, hidden_size) # todo: mean or sum or other?
+                input_memory = input_memory + delta_input_memory * memory_lr
+                batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
 
                 with torch.no_grad():
                     _, loss = pretrained_model(this_x, this_y)
-                    gpt_loss = loss / trained_seg_num + gpt_loss
+                    gpt_loss = loss / segment_num + gpt_loss
 
-            if len(past_segments_x) > 0:
-                batch_input_memory = input_memory.unsqueeze(0).repeat(batch_size, 1, 1)
+                # kl loss -----------------------------------------------------------------
+                logits_before_reduce = logits_before_reduce.view(-1, logits_before_reduce.shape[-1]) # shape=(batch_size*seq_len, vocab_size)
+                logits_before_reduce = logits_before_reduce[this_attention_mask.reshape(-1) == 1] # shape=(non-padding, vocab_size)
+
                 target_model_parameter = evolver_model(input_memory=batch_input_memory, produce_parameter_flag=True)
+                logits_after_reduce, loss = pretrained_model(this_x, this_y, target_model_parameter)
+                all_loss = loss / segment_num + all_loss
+                after_reduce_repeat_loss = loss / segment_num + after_reduce_repeat_loss
+
+                logits_after_reduce = logits_after_reduce.view(-1, logits_after_reduce.shape[-1]) # shape=(batch_size*seq_len, vocab_size)  
+                logits_after_reduce = logits_after_reduce[this_attention_mask.reshape(-1) == 1] # shape=(non-padding, vocab_size)
+
+                # !!!!!!!!!!!!! try 1 try
+                # loss = F.kl_div(F.log_softmax(logits_after_reduce, dim=-1), F.softmax(logits_before_reduce, dim=-1), reduction='batchmean')
+                loss = F.kl_div(F.log_softmax(logits_after_reduce, dim=-1), F.softmax(logits_before_reduce.detach(), dim=-1), reduction='batchmean')
+                all_loss = loss / segment_num + all_loss
+                kl_loss = loss / segment_num + kl_loss
+                
 
             # 复习一下past_segments
             for (this_x, this_y) in zip(past_segments_x, past_segments_y):
                 # todo 
                 # add kl to avoid forgetting
                 _, loss = pretrained_model(this_x, this_y, target_model_parameter)
-                all_loss = loss / trained_seg_num + all_loss
+                all_loss = loss / len(past_segments_x) + all_loss
                 revise_loss = loss / len(past_segments_x) + revise_loss
 
-                with torch.no_grad():
-                    _, loss = pretrained_model(this_x, this_y)
-                    gpt_loss = loss / trained_seg_num + gpt_loss
+                # with torch.no_grad():
+                #     _, loss = pretrained_model(this_x, this_y)
+                #     gpt_loss = loss / trained_seg_num + gpt_loss
 
             ### 
             all_loss = all_loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
@@ -544,11 +577,16 @@ while True:
             repeat_loss = repeat_loss / gradient_accumulation_steps
             revise_loss = revise_loss / gradient_accumulation_steps
 
+            kl_loss = kl_loss / gradient_accumulation_steps
+            after_reduce_repeat_loss = after_reduce_repeat_loss / gradient_accumulation_steps
+
         lossf += all_loss.item()
         gpt_lossf += gpt_loss.item()
 
         repeat_lossf += repeat_loss.item()
         revise_lossf += revise_loss.item()
+        kl_lossf += kl_loss.item()
+        after_reduce_repeat_lossf += after_reduce_repeat_loss.item()
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         this_rank_batch_train_data_pointer, X, Y, attention_mask, seg_length_list = get_seq_train_batch(train_data, this_rank_batch_train_data_pointer, segment_num, block_size, min_block_size, device, device_type)
@@ -591,6 +629,8 @@ while True:
                 "train/gpt_loss": gpt_lossf,
                 "train/repeat_loss": repeat_lossf,
                 "train/revise_loss": revise_lossf,
+                "train/after_reduce_repeat_loss": after_reduce_repeat_lossf,
+                "train/kl_loss": kl_lossf,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })

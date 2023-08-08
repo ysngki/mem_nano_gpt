@@ -4,20 +4,21 @@
 compile = True
 wandb_log = True
 wandb_project = 'repeat_mem'
-wandb_run_name='1st_batch_4_seg'
-wandb_notes='读取4个句子，读一个复述一个，最后一次性全部复述出来。模拟梯度传播。'
+wandb_run_name='batch_kl_4_seg'
+wandb_notes='读取4个句子，读一个复述一个，模拟梯度传播。'
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
 pretrained_model_name = 'gpt2'
 init_from = 'scratch' # 'scratch' or 'resume'
-ckpt_name = 'repeat_1st_batch_4_seg.pt'
+ckpt_name = 'repeat_batch_kl_4_seg.pt'
+# load_name = 'repeat_batch_no_revise_kl_4_seg.pt'
 
 seed=12306
-batch_size = 8
+batch_size = 6
 block_size = 512
 min_block_size = 256
 gradient_accumulation_steps = 4
-gpu_num = 3
+gpu_num = 4
 
 always_save_checkpoint = False
 
