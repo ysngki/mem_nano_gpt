@@ -197,7 +197,7 @@ if "gpt" in pretrained_model_name:
 elif "llama" in pretrained_model_name:
     print(f"Initializing from llaama weights: {pretrained_model_name}")
     override_args = dict(dropout=dropout)
-    pretrained_model = LlamaForCausalLM.from_pretrained(pretrained_model_name, override_args)
+    pretrained_model = LlamaForCausalLM.from_pretrained(pretrained_model_name, override_args, load_in_8bit=True, device_map={'': device}, torch_dtype=torch.float16)
 
     # backbone forzen
     for p in pretrained_model.parameters():
@@ -277,7 +277,6 @@ checkpoint = None # free up memory
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
-    pretrained_model = torch.compile(pretrained_model) # requires PyTorch 2.0
     evolver_model = torch.compile(evolver_model) # requires PyTorch 2.0
 
 # wrap model into DDP container
@@ -336,7 +335,7 @@ def estimate_predict_loss():
                 target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
                 
                 for si in range(segment_num):
-                    output_embeds = pretrained_model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
+                    output_embeds = pretrained_model(this_x, input_parameter=target_model_parameter, output_embeds=True)
 
                     # X -> memory
                     input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
@@ -517,7 +516,7 @@ while True:
                 # read this segment and update memory ------------------------------------------
                 # generate input embeddings by pretrained model
                 with torch.no_grad():
-                    output_embeds = pretrained_model(idx=this_x, input_parameter=target_model_parameter, output_embeds=True)
+                    output_embeds = pretrained_model(this_x, input_parameter=target_model_parameter, output_embeds=True)
 
                 # X -> memory
                 input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
