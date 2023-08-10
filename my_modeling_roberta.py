@@ -1075,7 +1075,7 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         self.num_memory = config.num_memory
         self.initial_memory = nn.parameter.Parameter(data=torch.randn((self.num_memory, self.config.hidden_size)))
 
-        self.conversion_dense = nn.Linear(config.hidden_size, config.hidden_size * self.config.num_target_model_layer)
+        self.conversion_dense = nn.Linear(config.hidden_size, self.config.target_hidden_size * self.config.num_target_model_layer)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1163,7 +1163,7 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         batch_size, memory_len, _ = input_memory.size()
 
         all_layer_new_memory =  self.conversion_dense(input_memory) # (batch size, memory len, dim * gpt layer num)
-        all_layer_new_memory = all_layer_new_memory.reshape(batch_size, memory_len, self.config.num_target_model_layer, self.config.hidden_size)
+        all_layer_new_memory = all_layer_new_memory.reshape(batch_size, memory_len, self.config.num_target_model_layer, self.config.target_hidden_size)
         all_layer_new_memory = all_layer_new_memory.permute(2, 0, 1, 3) # (gpt layer num, batch size, memory len, dim)
         
         return all_layer_new_memory

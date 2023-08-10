@@ -28,6 +28,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.nn.functional as F
+from peft import prepare_model_for_int8_training
 
 from model import GPTConfig
 from model import MemoryGPT as GPT
@@ -35,7 +36,7 @@ from my_configuration_roberta import MemoryRobertaConfig
 from my_modeling_roberta import MemoryRobertaModel
 from my_modeling_llama import LlamaForCausalLM
 
-from my_utils import get_seq_train_batch
+from my_utils import get_seq_train_batch, print_model_size
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a evolver (roberta)
@@ -45,18 +46,18 @@ evolver_n_embd = 768
 evolver_n_intermediate = 3072
 evolver_n_mem = 50
 
+peft_method = "prompt"
 ######### no use
 evolver_pad_token_id = 0
-evolver_gpt2_token_id_offset = 20 # the token id produced by gpt2 tokenizer should added by this offset
 #################
 
 segment_num = 1 # if > 1, train memory
-num_target_model_layer = 12
 
 remember_prob = 95 # 大于这个的话，minibatch的记忆都会被删除
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+cache_dir="/data/yuanhang/hf_cache"
 wandb_notes=''
 seed=1337
 out_dir = 'out'
@@ -100,7 +101,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda:0' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 wandb_id = "" # if set, will resume the run with this id
@@ -189,37 +190,32 @@ if "gpt" in pretrained_model_name:
     override_args = dict(dropout=dropout)
     pretrained_model = GPT.from_pretrained(pretrained_model_name, override_args)
     pretrained_model.to(device)
-    # backbone forzen
-    for p in pretrained_model.parameters():
-        p.requires_grad_(False)
-    
-    pretrained_model_config = pretrained_model.config
-elif "llama" in pretrained_model_name:
-    print(f"Initializing from llaama weights: {pretrained_model_name}")
-    override_args = dict(dropout=dropout)
-    pretrained_model = LlamaForCausalLM.from_pretrained(pretrained_model_name, override_args, load_in_8bit=True, device_map={'': device}, torch_dtype=torch.float16)
 
-    # backbone forzen
-    for p in pretrained_model.parameters():
-        p.requires_grad_(False)
-    
+    pretrained_model_config = pretrained_model.config
+    pretrained_model_config.num_hidden_layers = 12
+    pretrained_model_config.hidden_size = 768
+elif "llama" in pretrained_model_name:
+    print(f"Initializing from llama weights: {pretrained_model_name}")
+    # pretrained_model = LlamaForCausalLM.from_pretrained(pretrained_model_name, load_in_8bit=True, device_map={'': device}, torch_dtype=torch.float16, cache_dir=cache_dir)
+    pretrained_model = LlamaForCausalLM.from_pretrained(pretrained_model_name, load_in_8bit=True, device_map="auto", torch_dtype=torch.float16, cache_dir=cache_dir)
+    pretrained_model = prepare_model_for_int8_training(pretrained_model)
+
     pretrained_model_config = pretrained_model.config
 else:
     raise Exception(f"Unrecognized pretrained model {pretrained_model_name}")
-
-pretrained_model.to(device)
 
 # backbone forzen
 for p in pretrained_model.parameters():
     p.requires_grad_(False)
 
+print_model_size(pretrained_model, pretrained_model_config, ddp_rank)
 # --------------------------------------------------------------------------
 # create my evolver 
 if init_from == 'scratch':
-    evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size + evolver_gpt2_token_id_offset, num_hidden_layers=evolver_n_layer,
+    evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size, num_hidden_layers=evolver_n_layer,
                                         num_attention_heads=evolver_n_head, hidden_size=evolver_n_embd, max_position_embeddings=block_size, intermediate_size=evolver_n_intermediate,
-                                        pad_token_id=evolver_pad_token_id, gpt2_token_id_offset=evolver_gpt2_token_id_offset, num_memory=evolver_n_mem,
-                                        num_target_model_layer=num_target_model_layer, no_embeddings=True)
+                                        pad_token_id=evolver_pad_token_id, num_memory=evolver_n_mem,
+                                        num_target_model_layer=pretrained_model_config.num_hidden_layers, no_embeddings=True, target_hidden_size=pretrained_model_config.hidden_size)
     evolver_model = MemoryRobertaModel(evolver_config)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -240,10 +236,10 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from == 'load':
-    evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size + evolver_gpt2_token_id_offset, num_hidden_layers=evolver_n_layer,
+    evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size, num_hidden_layers=evolver_n_layer,
                                         num_attention_heads=evolver_n_head, hidden_size=evolver_n_embd, max_position_embeddings=block_size, intermediate_size=evolver_n_intermediate,
-                                        pad_token_id=evolver_pad_token_id, gpt2_token_id_offset=evolver_gpt2_token_id_offset, num_memory=evolver_n_mem,
-                                        num_target_model_layer=num_target_model_layer, no_embeddings=True)
+                                        pad_token_id=evolver_pad_token_id, num_memory=evolver_n_mem,
+                                        num_target_model_layer=pretrained_model_config.num_hidden_layers, no_embeddings=True, target_hidden_size=pretrained_model_config.hidden_size)
     evolver_model = MemoryRobertaModel(evolver_config)
 
     # resume training from a checkpoint. 
@@ -277,6 +273,7 @@ checkpoint = None # free up memory
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
+    pretrained_model = torch.compile(pretrained_model) # requires PyTorch 2.0
     evolver_model = torch.compile(evolver_model) # requires PyTorch 2.0
 
 # wrap model into DDP container
@@ -301,10 +298,12 @@ def estimate_predict_loss():
         losses = torch.zeros(eval_iters)
         gpt_losses = torch.zeros(eval_iters)
         segment_losses = torch.zeros((segment_num, eval_iters))
+        context_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             this_iter_loss = torch.tensor(0.0, device=device)
             this_iter_gpt_loss = torch.tensor(0.0, device=device)
             this_iter_segment_loss = torch.zeros((segment_num, ), device=device)
+            this_iter_context_loss = torch.tensor(0.0, device=device)
 
             # random start
             random_data_start_pointer = []
@@ -335,12 +334,11 @@ def estimate_predict_loss():
                 target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
                 
                 for si in range(segment_num):
-                    output_embeds = pretrained_model(this_x, input_parameter=target_model_parameter, output_embeds=True)
-
+                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True)
                     # X -> memory
                     input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
-
                     # last memory -> X
+                    last_target_model_parameter = target_model_parameter
                     target_model_parameter = evolver_model(input_memory=input_memory, produce_parameter_flag=True)
 
                     # get data for next segment
@@ -350,12 +348,31 @@ def estimate_predict_loss():
                     next_seg_len = this_micro_seg_length_list[si+1]
 
                     # predict next segment with memory
-                    _, loss = pretrained_model(next_x, next_y, target_model_parameter)
+                    _, loss = pretrained_model(input_ids=next_x, labels=next_y, input_parameter=target_model_parameter, peft=peft_method)
                     this_iter_loss = loss + this_iter_loss
                     this_iter_segment_loss[si] = loss + this_iter_segment_loss[si]
 
-                    _, gpt_loss  = pretrained_model(next_x, next_y)
+                    _, gpt_loss  = pretrained_model(input_ids=next_x, labels=next_y)
                     this_iter_gpt_loss = gpt_loss + this_iter_gpt_loss
+
+                    # predict with context (teacher) and last memory
+                    with torch.no_grad():
+                        bsz = this_x.shape[0]
+                        two_seg_block_size = this_x.shape[1] + next_x.shape[1]
+
+                        # concatenate two segments to get context
+                        x_container = this_x.new_full((bsz, two_seg_block_size), fill_value=0)
+                        for bi in range(bsz):
+                            x_container[bi, :this_seg_len[bi]] = this_x[bi, :this_seg_len[bi]]
+                            x_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_x[bi, :next_seg_len[bi]]
+                        
+                        y_container = this_y.new_full(x_container.size(), fill_value=-1)
+                        for bi in range(bsz):
+                            y_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_y[bi, :next_seg_len[bi]]
+
+                        # predict
+                        _, loss = pretrained_model(input_ids=x_container, labels=y_container, input_parameter=last_target_model_parameter, peft=peft_method) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
+                        this_iter_context_loss = loss + this_iter_context_loss
 
                     # assignment
                     this_x = next_x
@@ -366,14 +383,17 @@ def estimate_predict_loss():
             this_iter_loss = this_iter_loss / (gradient_accumulation_steps * segment_num)
             this_iter_gpt_loss = this_iter_gpt_loss / (gradient_accumulation_steps * segment_num)
             this_iter_segment_loss = this_iter_segment_loss / gradient_accumulation_steps
+            this_iter_context_loss = this_iter_context_loss / (gradient_accumulation_steps * segment_num)
 
             losses[k] = this_iter_loss.item()
             gpt_losses[k] = this_iter_gpt_loss.item()
             segment_losses[:, k] = this_iter_segment_loss
+            context_losses[k] = this_iter_context_loss.item()
 
         out[split] = losses.mean()
         out[split + "_gpt"] = gpt_losses.mean()
         out[split + "_segment"] = segment_losses.mean(dim=1).tolist()
+        out[split + "_context"] = context_losses.mean()
     evolver_model.train()
     return out
 
@@ -425,6 +445,8 @@ while True:
                 "val/val_loss": losses['val'],
                 "val/train_gpt_loss": losses['train_gpt'],
                 "val/val_gpt_loss": losses['val_gpt'],
+                "val/train_context_loss": losses['train_context'],
+                "val/val_context_loss": losses['val_context'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
@@ -516,7 +538,7 @@ while True:
                 # read this segment and update memory ------------------------------------------
                 # generate input embeddings by pretrained model
                 with torch.no_grad():
-                    output_embeds = pretrained_model(this_x, input_parameter=target_model_parameter, output_embeds=True)
+                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True)
 
                 # X -> memory
                 input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
@@ -534,13 +556,13 @@ while True:
                 next_seg_len = this_micro_seg_length_list[si+1]
 
                 # predict next segment with memory
-                logits_with_memory, loss = pretrained_model(next_x, next_y, target_model_parameter)
+                logits_with_memory, loss = pretrained_model(input_ids=next_x, labels=next_y, input_parameter=target_model_parameter, peft=peft_method)
                 all_loss = loss + all_loss
                 predict_loss = loss + predict_loss
 
                 # reference
                 with torch.no_grad():
-                    _, loss = pretrained_model(next_x, next_y)
+                    _, loss = pretrained_model(next_x, labels=next_y)
                     gpt_loss = loss + gpt_loss
 
                 #############################
@@ -567,7 +589,7 @@ while True:
                         next_segment_mask[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = 1
                     
                     # predict
-                    logits_with_context, loss = pretrained_model(x_container, y_container, last_target_model_parameter) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
+                    logits_with_context, loss = pretrained_model(x_container, labels=y_container, input_parameter=last_target_model_parameter, peft=peft_method) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
                     context_gpt_loss = loss + context_gpt_loss
                 
                 # select logits of second segment from logits_with_context
@@ -588,12 +610,12 @@ while True:
 
             # 复习一下past_segments
             for (this_x, this_y) in zip(past_segments_x, past_segments_y):
-                _, loss = pretrained_model(this_x, this_y, target_model_parameter)
+                _, loss = pretrained_model(this_x, labels=this_y, input_parameter=target_model_parameter, peft=peft_method)
                 all_loss = loss + all_loss
                 revise_loss = loss + revise_loss
 
                 with torch.no_grad():
-                    _, loss = pretrained_model(this_x, this_y)
+                    _, loss = pretrained_model(this_x, labels=this_y)
                     gpt_loss = loss + gpt_loss
 
             ###

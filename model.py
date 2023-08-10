@@ -100,7 +100,7 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, input_parameter=None):
+    def prompt_forward(self, x, input_parameter=None):
         if input_parameter is None:
             next_x = x + self.attn(self.ln_1(x))
         else:
@@ -110,6 +110,40 @@ class Block(nn.Module):
 
         next_x = next_x + self.mlp(self.ln_2(next_x))
         return next_x
+
+    def lora_forward(self, x, input_parameter=None):
+        next_x = x + self.attn(self.ln_1(x))
+
+        ln_next_x = self.ln_2(next_x)
+
+        if input_parameter is not None:
+            part_new_x = self.mlp(ln_next_x)
+
+            # input_parameter (batch size, memory len, dim)
+            r = input_parameter.shape[1] // 2
+
+            down_matrix = input_parameter[:, :r, :] # (batch size, r, dim)
+            up_matrix = input_parameter[:, r:, :] # (batch size, r, dim)
+
+            intermediate_weight = torch.matmul(ln_next_x, down_matrix.transpose(1, 2)) # (batch size, seq len, r)
+            intermediate_weight = self.mlp.gelu(intermediate_weight) # (batch size, seq len, r)
+            new_x = torch.matmul(intermediate_weight, up_matrix) # (batch size, seq len, dim)
+            new_x = self.mlp.dropout(new_x) # (batch size, seq len, dim)
+
+            next_x = next_x + new_x + part_new_x
+        else:
+            next_x = next_x + self.mlp(ln_next_x)
+
+        return next_x
+
+    def forward(self, x, input_parameter=None, peft="prompt"):
+        # return self.lora_forward(x, input_parameter)
+        if peft == "prompt":
+            return self.prompt_forward(x, input_parameter)
+        elif peft == "lora":
+            return self.lora_forward(x, input_parameter)
+        else:
+            raise ValueError("peft should be prompt or lora")
 
 @dataclass
 class GPTConfig:
@@ -388,14 +422,14 @@ class MemoryGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, input_parameter=None, output_embeds=False):
-        device = idx.device
-        b, t = idx.size()
+    def forward(self, input_ids, labels=None, input_parameter=None, output_embeds=False, peft="prompt"):
+        device = input_ids.device
+        b, t = input_ids.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.transformer.wte(input_ids) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
 
         x = tok_emb + pos_emb
@@ -414,13 +448,13 @@ class MemoryGPT(nn.Module):
             else:
                 raise Exception("check here (input memory dimension) !")
             
-            x = block(x, input_parameter=this_input_parameter)
+            x = block(x, input_parameter=this_input_parameter, peft=peft)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
+        if labels is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -539,7 +573,7 @@ class MemoryGPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, input_parameter=None, eot_token=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, input_parameter=None, eot_token=None, peft="prompt"):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -549,7 +583,7 @@ class MemoryGPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond, input_parameter=input_parameter)
+            logits, _ = self(idx_cond, input_parameter=input_parameter, peft=peft)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

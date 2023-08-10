@@ -2,6 +2,22 @@ import numpy as np
 import torch
 
 
+def print_model_size(model, config, rank: int = 0) -> None:
+    """
+    Print model name, the number of trainable parameters and initialization time.
+
+    Args:
+        model: The PyTorch model.
+        model_name (str): Name of the model.
+        init_time_start (float): Initialization start time.
+        init_time_end (float): Initialization end time.
+        rank (int, optional): Current process's rank. Defaults to 0.
+    """
+    if rank == 0:
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\n--> pretrained model has {total_params / 1e6} Million trainable params\n")
+
+
 # get data for a minibatch
 def get_seq_train_batch(data, data_pointer, this_batch_seg_num, block_size, min_block_size, device, device_type, plus_one=False):
     x_list = []

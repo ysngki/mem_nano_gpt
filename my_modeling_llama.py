@@ -200,6 +200,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         input_parameter: Optional[torch.FloatTensor] = None,
+        peft: Optional[str] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -242,8 +243,23 @@ class LlamaModel(LlamaPreTrainedModel):
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
             )
+        
+        memory_len = 0
+        if input_parameter is not None and peft == "prompt":
+            device = inputs_embeds.device
+
+            memory_len = input_parameter.shape[-2]
+
+            attention_mask = torch.cat([
+                attention_mask[:, :past_key_values_length],
+                torch.ones((batch_size, memory_len), dtype=torch.bool, device=device), 
+                attention_mask[:, past_key_values_length:]
+                ], dim=-1)
+            
+            position_ids = torch.cat([torch.zeros((position_ids.shape[0], memory_len), dtype=torch.long, device=device), position_ids], dim=-1)
+
         attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+            attention_mask, (batch_size, seq_length + memory_len), inputs_embeds, past_key_values_length
         )
 
         hidden_states = inputs_embeds
@@ -265,6 +281,10 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+            if memory_len > 0 and peft=="prompt":
+                this_layer_prompt = input_parameter[idx].to(hidden_states.device)
+                hidden_states = torch.cat([this_layer_prompt, hidden_states], dim=1)
 
             if self.gradient_checkpointing and self.training:
                 raise Exception("honoka here!!!")
@@ -293,6 +313,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+
+            if memory_len > 0 and peft=="prompt":
+                hidden_states = hidden_states[:, memory_len:, :]
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
@@ -361,6 +384,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         return_dict: Optional[bool] = None,
         input_parameter: Optional[torch.FloatTensor] = None,
         output_embeds: Optional[bool] = None,
+        peft: Optional[str] = "prompt",
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -389,7 +413,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         ```"""
 
         if output_embeds:
-            return self.model.embed_tokens(input_ids)
+            embeddings = self.model.embed_tokens(input_ids)
+            return embeddings
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -409,6 +434,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             input_parameter=input_parameter,
+            peft=peft,
         )
 
         hidden_states = outputs[0]
@@ -428,6 +454,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+
+        return logits, loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
