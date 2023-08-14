@@ -52,29 +52,30 @@ def predict_lora_llama_config(this_config):
 
 
 def predict_llama_config(this_config):
+    this_config.out_dir = 'llama_out'
     this_config.compile = False
     this_config.wandb_log = True
     this_config.wandb_project = 'predict'
-    this_config.wandb_run_name='1st_kl_1seg_m20_llama'
+    this_config.wandb_run_name='1st_1seg_m20_llama'
     this_config.wandb_notes='读取1个句子，每次预测下一个句子，并且有kl loss来指导预测。读取之前训练的一个句子的'
 
     this_config.peft_method = "prompt"
 
     # these make the total batch size be ~0.5M
     # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-    this_config.init_from = 'resume'
+    this_config.init_from = 'scratch'
     this_config.pretrained_model_name = 'meta-llama/Llama-2-7b-hf'
     this_config.accelerate = True
-    this_config.load_name = 'predict_1st_kl_1seg_m20_llama.pt'
-    this_config.ckpt_name = 'predict_1st_kl_1seg_m20_llama.pt'
+    # this_config.load_name = 'predict_1st_kl_1seg_m20_llama.pt'
+    this_config.ckpt_name = 'predict_1st_1seg_m20_llamaa.pt'
 
     this_config.dataset = 'llama_openwebtext'
 
     this_config.batch_size = 1
     this_config.block_size = 512
     this_config.min_block_size = 256
-    this_config.gradient_accumulation_steps = 16
-    this_config.gpu_num = 3
+    this_config.gradient_accumulation_steps = 24
+    this_config.gpu_num = 2
 
     # this makes total number of tokens be 300B
     this_config.max_iters = 600000

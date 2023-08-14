@@ -46,7 +46,7 @@ from transformers.file_utils import (
     replace_return_docstrings,
 )
 from transformers.utils import logging
-
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 # from transformers import RobertaConfig
 from my_configuration_roberta import MemoryRobertaConfig
 
@@ -64,6 +64,24 @@ ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "roberta-large-openai-detector",
     # See all RoBERTa models at https://huggingface.co/models?filter=roberta
 ]
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 
 class RobertaEmbeddings(nn.Module):
@@ -181,6 +199,10 @@ class RobertaSelfAttention(nn.Module):
 
         self.is_decoder = config.is_decoder
 
+        self.rotary_emb_flag = config.rotary_emb_flag
+        if self.rotary_emb_flag:
+            self.rotary_emb = LlamaRotaryEmbedding(self.attention_head_size, max_position_embeddings=config.max_position_embeddings + config.num_memory)
+
     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(new_x_shape)
@@ -208,20 +230,33 @@ class RobertaSelfAttention(nn.Module):
             key_layer = past_key_value[0]
             value_layer = past_key_value[1]
             attention_mask = encoder_attention_mask
+            raise Exception("Should Implement rotary emb here")
         elif is_cross_attention:
             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
             attention_mask = encoder_attention_mask
+            raise Exception("Should Implement rotary emb here")
         elif past_key_value is not None:
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
+            raise Exception("Should Implement rotary emb here")
         else:
             key_layer = self.transpose_for_scores(self.key(hidden_states))
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
+
+        if self.rotary_emb_flag:
+            kv_seq_len = key_layer.shape[-2]
+            cos, sin = self.rotary_emb(value_layer, seq_len=kv_seq_len)
+
+            position_ids = torch.arange(
+                0, kv_seq_len, dtype=torch.long, device=key_layer.device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, kv_seq_len)
+            query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, position_ids)
 
         use_cache = past_key_value is not None
         if self.is_decoder:

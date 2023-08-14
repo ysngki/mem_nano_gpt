@@ -47,6 +47,10 @@ def predict_accelerate_main(config):
 
     # load pretrained model
     pretrained_model, pretrained_model_config = load_pretrained_model(config)
+    if "llama" in config.pretrained_model_name:
+        rotary_emb_flag = True
+    else:
+        rotary_emb_flag = False
 
     # backbone forzen
     for p in pretrained_model.parameters():
@@ -77,7 +81,8 @@ def predict_accelerate_main(config):
         evolver_config = MemoryRobertaConfig(vocab_size=pretrained_model_config.vocab_size, num_hidden_layers=config.evolver_n_layer,
                                             num_attention_heads=config.evolver_n_head, hidden_size=config.evolver_n_embd, max_position_embeddings=config.block_size, intermediate_size=config.evolver_n_intermediate,
                                             pad_token_id=config.evolver_pad_token_id, num_memory=config.evolver_n_mem,
-                                            num_target_model_layer=pretrained_model_config.num_hidden_layers, no_embeddings=True, target_hidden_size=pretrained_model_config.hidden_size)
+                                            num_target_model_layer=pretrained_model_config.num_hidden_layers, no_embeddings=True, 
+                                            target_hidden_size=pretrained_model_config.hidden_size, rotary_emb_flag=rotary_emb_flag)
         evolver_model = MemoryRobertaModel(evolver_config)
     elif config.init_from == 'resume':
         # although model will be loaded by accelerate later, I still load it here to get the config
