@@ -123,10 +123,12 @@ def load_pretrained_model(config):
         pretrained_model_config = pretrained_model.config
         pretrained_model_config.num_hidden_layers = 12
         pretrained_model_config.hidden_size = 768
+        pretrained_model_config.max_position_embeddings = 1024
     elif "llama" in config.pretrained_model_name:
         print(f"Initializing from llama weights: {config.pretrained_model_name}")
-        # pretrained_model = LlamaForCausalLM.from_pretrained(pretrained_model_name, load_in_8bit=True, device_map={'': device}, torch_dtype=torch.float16, cache_dir=cache_dir)
-        pretrained_model = LlamaForCausalLM.from_pretrained(config.pretrained_model_name, load_in_8bit=True, device_map="auto", torch_dtype=torch.float16, cache_dir=config.cache_dir)
+        # pretrained_model = LlamaForCausalLM.from_pretrained(config.pretrained_model_name, device_map="auto", cache_dir=config.cache_dir)
+        pretrained_model = LlamaForCausalLM.from_pretrained(config.pretrained_model_name, load_in_8bit=True, device_map={'': config.device}, torch_dtype=torch.float16, cache_dir=config.cache_dir)
+        # pretrained_model = LlamaForCausalLM.from_pretrained(config.pretrained_model_name, load_in_8bit=True, device_map="auto", torch_dtype=torch.float16, cache_dir=config.cache_dir)
         pretrained_model = prepare_model_for_int8_training(pretrained_model)
 
         pretrained_model_config = pretrained_model.config
@@ -134,6 +136,111 @@ def load_pretrained_model(config):
         raise Exception(f"Unrecognized pretrained model {config.pretrained_model_name}")
 
     return pretrained_model, pretrained_model_config
+
+
+# helps estimate an arbitrarily accurate loss over either split using many batches
+@torch.no_grad()
+def accelerate_estimate_predict_loss(accelerator, model, pretrained_model, val_dataloader, config):
+    out = {}
+    model.eval()
+
+    split = "val"
+
+    losses = torch.zeros(config.eval_iters, device=config.device)
+    gpt_losses = torch.zeros(config.eval_iters, device=config.device)
+    segment_losses = torch.zeros((config.segment_num, config.eval_iters), device=config.device)
+    context_losses = torch.zeros(config.eval_iters, device=config.device)
+    
+    actual_batch_count = 0
+    for val_bi, batch in enumerate(val_dataloader):
+        if actual_batch_count < config.eval_iters:
+
+            this_iter_loss = torch.tensor(0.0, device=config.device)
+            this_iter_gpt_loss = torch.tensor(0.0, device=config.device)
+            this_iter_segment_loss = torch.zeros((config.segment_num, ), device=config.device)
+            this_iter_context_loss = torch.tensor(0.0, device=config.device)
+
+            # empty memory
+            input_memory = None
+
+            for micro_step in range(config.gradient_accumulation_steps):
+                input_ids, labels, attention_mask, segment_lengths = batch
+
+                # get data for first segment
+                this_x = input_ids[:, 0, :]
+                this_y = labels[:, 0, :]
+                this_attention_mask = attention_mask[:, 0, :]
+                this_seg_len = segment_lengths[:, 0]
+
+                target_model_parameter = model(input_memory=input_memory, produce_parameter_flag=True)
+                
+                for si in range(config.segment_num):
+                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True, return_dict=False).to(model.dtype)
+                    # X -> memory
+                    input_memory = model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
+                    # last memory -> X
+                    last_target_model_parameter = target_model_parameter
+                    target_model_parameter = model(input_memory=input_memory, produce_parameter_flag=True)
+
+                    # get data for next segment
+                    next_x = input_ids[:, si + 1, :]
+                    next_y = labels[:, si + 1, :]
+                    next_attention_mask = attention_mask[:, si + 1, :]
+                    next_seg_len = segment_lengths[:, si+1]
+
+                    # predict next segment with memory
+                    _, loss = pretrained_model(input_ids=next_x, labels=next_y, input_parameter=target_model_parameter, peft=config.peft_method, return_dict=False)
+                    this_iter_loss = loss + this_iter_loss
+                    this_iter_segment_loss[si] = loss + this_iter_segment_loss[si]
+
+                    _, gpt_loss  = pretrained_model(input_ids=next_x, labels=next_y, return_dict=False)
+                    this_iter_gpt_loss = gpt_loss + this_iter_gpt_loss
+
+                    # predict with context (teacher) and last memory
+                    with torch.no_grad():
+                        bsz = this_x.shape[0]
+                        two_seg_block_size = this_x.shape[1] + next_x.shape[1]
+
+                        # concatenate two segments to get context
+                        x_container = this_x.new_full((bsz, two_seg_block_size), fill_value=0)
+                        for bi in range(bsz):
+                            x_container[bi, :this_seg_len[bi]] = this_x[bi, :this_seg_len[bi]]
+                            x_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_x[bi, :next_seg_len[bi]]
+                        
+                        y_container = this_y.new_full(x_container.size(), fill_value=-1)
+                        for bi in range(bsz):
+                            y_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_y[bi, :next_seg_len[bi]]
+
+                        # predict
+                        _, loss = pretrained_model(input_ids=x_container, labels=y_container, input_parameter=last_target_model_parameter, peft=config.peft_method, return_dict=False) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
+                        this_iter_context_loss = loss + this_iter_context_loss
+
+                    # assignment
+                    this_x = next_x
+                    this_y = next_y
+                    this_attention_mask = next_attention_mask
+                    this_seg_len = next_seg_len
+
+            this_iter_loss = this_iter_loss / (config.gradient_accumulation_steps * config.segment_num)
+            this_iter_gpt_loss = this_iter_gpt_loss / (config.gradient_accumulation_steps * config.segment_num)
+            this_iter_segment_loss = this_iter_segment_loss / config.gradient_accumulation_steps
+            this_iter_context_loss = this_iter_context_loss / (config.gradient_accumulation_steps * config.segment_num)
+
+            losses[val_bi] = this_iter_loss.item()
+            gpt_losses[val_bi] = this_iter_gpt_loss.item()
+            segment_losses[:, val_bi] = this_iter_segment_loss
+            context_losses[val_bi] = this_iter_context_loss.item()
+
+            actual_batch_count += 1
+        else:
+            break
+
+        out[split] = accelerator.reduce(losses.mean(), reduction="mean")
+        out[split + "_gpt"] = accelerator.reduce(gpt_losses.mean(), reduction="mean")
+        out[split + "_segment"] = accelerator.reduce(segment_losses.mean(dim=1), reduction="mean")
+        out[split + "_context"] = accelerator.reduce(context_losses.mean(), reduction="mean")
+    model.train()
+    return out
 
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -189,7 +296,7 @@ def estimate_predict_loss(model, pretrained_model, train_data, val_data, actual_
                 target_model_parameter = model(input_memory=input_memory, produce_parameter_flag=True)
                 
                 for si in range(config.segment_num):
-                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True)
+                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True, return_dict=False)
                     # X -> memory
                     input_memory = model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
                     # last memory -> X
@@ -203,11 +310,11 @@ def estimate_predict_loss(model, pretrained_model, train_data, val_data, actual_
                     next_seg_len = this_micro_seg_length_list[si+1]
 
                     # predict next segment with memory
-                    _, loss = pretrained_model(input_ids=next_x, labels=next_y, input_parameter=target_model_parameter, peft=config.peft_method)
+                    _, loss = pretrained_model(input_ids=next_x, labels=next_y, input_parameter=target_model_parameter, peft=config.peft_method, return_dict=False)
                     this_iter_loss = loss + this_iter_loss
                     this_iter_segment_loss[si] = loss + this_iter_segment_loss[si]
 
-                    _, gpt_loss  = pretrained_model(input_ids=next_x, labels=next_y)
+                    _, gpt_loss  = pretrained_model(input_ids=next_x, labels=next_y, return_dict=False)
                     this_iter_gpt_loss = gpt_loss + this_iter_gpt_loss
 
                     # predict with context (teacher) and last memory
@@ -226,7 +333,7 @@ def estimate_predict_loss(model, pretrained_model, train_data, val_data, actual_
                             y_container[bi, this_seg_len[bi]:this_seg_len[bi] + next_seg_len[bi]] = next_y[bi, :next_seg_len[bi]]
 
                         # predict
-                        _, loss = pretrained_model(input_ids=x_container, labels=y_container, input_parameter=last_target_model_parameter, peft=config.peft_method) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
+                        _, loss = pretrained_model(input_ids=x_container, labels=y_container, input_parameter=last_target_model_parameter, peft=config.peft_method, return_dict=False) # shape of logits_with_context: (batch_size, two_seg_block_size, vocab_size)
                         this_iter_context_loss = loss + this_iter_context_loss
 
                     # assignment

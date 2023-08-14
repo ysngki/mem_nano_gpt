@@ -1149,6 +1149,7 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        fused_available = False
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
@@ -1245,6 +1246,8 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
+        else:
+            attention_mask = attention_mask.to(device)
 
         if self.config.no_embeddings:
             token_type_ids = None
@@ -1256,6 +1259,8 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
                     token_type_ids = buffered_token_type_ids_expanded
                 else:
                     token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+            else:
+                token_type_ids = token_type_ids.to(device)
 
         # attention mask for memory
         if self.num_memory > 0:

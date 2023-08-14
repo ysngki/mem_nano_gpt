@@ -422,7 +422,7 @@ class MemoryGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, input_ids, labels=None, input_parameter=None, output_embeds=False, peft="prompt"):
+    def forward(self, input_ids, labels=None, input_parameter=None, output_embeds=False, peft="prompt", return_dict=False):
         device = input_ids.device
         b, t = input_ids.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"

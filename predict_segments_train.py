@@ -37,13 +37,13 @@ from my_modeling_roberta import MemoryRobertaModel
 from my_modeling_llama import LlamaForCausalLM
 
 from my_utils import get_seq_train_batch, print_model_size, load_pretrained_model, get_lr, estimate_predict_loss
-
+from accelerate_train import predict_accelerate_main
 from config.training_config import train_config, import_function
 
 
 def main():
     # initialize config
-    config = train_config
+    config = train_config()
 
     # load config
     if len(sys.argv) < 2:
@@ -57,6 +57,9 @@ def main():
 
     # set frequently used parameter
     device = config.device
+
+    if config.accelerate:
+        return predict_accelerate_main(config)
 
     # --------------------------------------------------------------------------
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -204,7 +207,7 @@ def main():
         if wandb_id == "":
             wandb_id = wandb.util.generate_id()
         config['wandb_id'] = wandb_id
-        wandb.init(id=wandb_id, resume='allow', project=config.wandb_project, name=config.wandb_run_name, config=config, notes=config.wandb_notes)
+        wandb.init(id=wandb_id, resume='allow', project=config.wandb_project, name=config.wandb_run_name, config=vars(config), notes=config.wandb_notes)
 
     # --------------------------------------------------------------------------
     # training loop
