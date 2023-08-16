@@ -1112,6 +1112,13 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
 
         self.conversion_dense = nn.Linear(config.hidden_size, self.config.target_hidden_size * self.config.num_target_model_layer)
 
+        if self.config.target_hidden_size != self.config.hidden_size:
+            self.project_in = nn.Linear(self.config.target_hidden_size, self.config.hidden_size, bias=False)
+            # self.project_out = nn.Linear(self.config.hidden_size, self.config.target_hidden_size, bias=False)
+        else:
+            self.project_in = None
+            # self.project_out = None
+        
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1326,6 +1333,8 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
         
         if self.config.no_embeddings:
             embedding_output = inputs_embeds
+            if self.project_in is not None:
+                embedding_output = self.project_in(embedding_output)
         else:
             embedding_output = self.embeddings(
                 input_ids=input_ids,
@@ -1358,6 +1367,8 @@ class MemoryRobertaModel(RobertaPreTrainedModel):
             return_dict=return_dict,
         )
         sequence_output = encoder_outputs[0]
+        # if self.project_out is not None:
+        #     sequence_output = self.project_out(sequence_output)
         pooled_output = None
 
         if actual_memory_len > 0:

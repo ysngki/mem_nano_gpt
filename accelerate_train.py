@@ -124,6 +124,11 @@ def predict_accelerate_main(config):
 
         evolver_model.load_state_dict(state_dict)
 
+    # compile the model
+    if config.compile:
+        print("compiling the model... (takes a ~minute)")
+        evolver_model = torch.compile(evolver_model) # requires PyTorch 2.0
+
     # --------------------------------------------------------------------------
     # optimizer related
     # optimizer
@@ -267,7 +272,8 @@ def predict_accelerate_main(config):
                 # generate input embeddings by pretrained model
                 with torch.no_grad():
                     output_embeds = pretrained_model(input_ids=this_x, output_embeds=True, return_dict=False)
-                    output_embeds = output_embeds.to(evolver_model.dtype)
+                    if hasattr(evolver_model, "dtype"):
+                        output_embeds = output_embeds.to(evolver_model.dtype)
 
                 # X -> memory
                 input_memory = evolver_model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]

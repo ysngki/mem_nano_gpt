@@ -5,6 +5,7 @@ import torch
 from peft import prepare_model_for_int8_training
 
 from my_modeling_llama import LlamaForCausalLM
+from my_modeling_opt import OPTForCausalLM
 from model import MemoryGPT as GPT
 
 
@@ -132,6 +133,11 @@ def load_pretrained_model(config):
         pretrained_model = prepare_model_for_int8_training(pretrained_model)
 
         pretrained_model_config = pretrained_model.config
+    elif "opt" in config.pretrained_model_name:
+        print(f"Initializing from opt weights: {config.pretrained_model_name}")
+        pretrained_model = OPTForCausalLM.from_pretrained(config.pretrained_model_name, load_in_8bit=True, device_map={'': config.device}, torch_dtype=torch.float16, cache_dir=config.cache_dir)
+        pretrained_model = prepare_model_for_int8_training(pretrained_model)
+        pretrained_model_config = pretrained_model.config
     else:
         raise Exception(f"Unrecognized pretrained model {config.pretrained_model_name}")
 
@@ -175,7 +181,9 @@ def accelerate_estimate_predict_loss(accelerator, model, pretrained_model, val_d
                 target_model_parameter = model(input_memory=input_memory, produce_parameter_flag=True)
                 
                 for si in range(config.segment_num):
-                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True, return_dict=False).to(model.dtype)
+                    output_embeds = pretrained_model(input_ids=this_x, output_embeds=True, return_dict=False)
+                    if hasattr(model, "dtype"):
+                        output_embeds = output_embeds.to(model.dtype)
                     # X -> memory
                     input_memory = model(inputs_embeds=output_embeds, attention_mask=this_attention_mask, input_memory=input_memory)["memory_output"]
                     # last memory -> X
